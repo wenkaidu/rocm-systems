@@ -542,6 +542,8 @@ static ncclResult_t ncclTopoPrefNetsChannelFirst(struct ncclTopoSystem* system, 
 // 1. Select NETs starting with those close to GPU(s), based on paths[n].type.
 // 2. add other NETs satisfying typeInter but not already in the list.
 NCCL_PARAM(ScatterEnable, "MNNVL_SCATTER_NETS_ENABLE", 1);
+NCCL_PARAM(MaxNicPathType, "MAX_NIC_PATH_TYPE", PATH_DIS);
+
 ncclResult_t ncclTopoSelectNets(struct ncclTopoSystem* system, int typeInter, int gpu, int nets[NCCL_TOPO_MAX_NODES], int* netCountRet) {
   ncclResult_t ret = ncclSuccess;
   int netCount = 0;
@@ -555,8 +557,12 @@ ncclResult_t ncclTopoSelectNets(struct ncclTopoSystem* system, int typeInter, in
     NCCLCHECK(ncclTopoPrefNetsChannelFirst(system, gpu, nets, &netCount));
   }
 
-  // Then add others satisfying typeInter
-  for (int t=0; t <= typeInter; t++) {
+  // Limit typeInter based on MAX_NIC_PATH_TYPE to avoid non-local NICs
+  int maxPathType = ncclParamMaxNicPathType();
+  int effectiveTypeInter = (maxPathType < PATH_DIS && maxPathType < typeInter) ? maxPathType : typeInter;
+
+  // Then add others satisfying effectiveTypeInter
+  for (int t=0; t <= effectiveTypeInter; t++) {
     for (int g = 0; g < system->nodes[GPU].count; g++) {
       if (gpu != -1 && gpu != g) continue;
       int localNetCount = 0, localNets[MAXCHANNELS];
@@ -573,6 +579,11 @@ ncclResult_t ncclTopoSelectNets(struct ncclTopoSystem* system, int typeInter, in
         if (found == netCount) nets[netCount++] = n;
       }
     }
+  }
+
+  if (effectiveTypeInter < typeInter) {
+    TRACE(NCCL_GRAPH, "Filtered NIC path types from %d to %d (maxPathType=%d)",
+          typeInter, effectiveTypeInter, maxPathType);
   }
 
   *netCountRet = netCount;
@@ -1043,6 +1054,13 @@ ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph
     NCCLCHECK(ncclTopoGetGpuMinPath(system, NET, &minTypeInter));
     NCCLCHECK(ncclTopoGetGpuMaxPath(system, NET, &maxTypeInter));
     maxTypeIntra = maxTypeInter;
+
+    // Limit maxTypeInter based on MAX_NIC_PATH_TYPE to avoid non-local NICs
+    int maxNicPathType = ncclParamMaxNicPathType();
+    if (maxNicPathType < PATH_DIS && maxNicPathType < maxTypeInter) {
+      maxTypeInter = maxNicPathType;
+      maxTypeIntra = maxTypeInter;
+    }
   }
 
   graph->typeIntra = minTypeIntra;
