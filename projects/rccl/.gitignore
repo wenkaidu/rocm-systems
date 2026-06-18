@@ -3,6 +3,11 @@
 *.gcov
 /coverage/
 build*/
+# Allow Cursor skills whose directory names start with "build-" (build*/ matches them).
+!.cursor/skills/build-install-mpich/
+!.cursor/skills/build-install-mpich/**
+!.cursor/skills/build-rccl-tests/
+!.cursor/skills/build-rccl-tests/**
 install*/
 ext/
 src/transport/net_ib_rocm.cc
