@@ -2299,6 +2299,7 @@ static ncclResult_t updateCollCostTable(
     int collNetSupport, int nvlsSupport, int numPipeOps,
     int userAlgoInput,
     float** collCostTable) {
+  (void)userAlgoInput; /* reserved for parity with callers; PAT no longer gated by user algo here (NCCL-aligned). */
   float (*table)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])collCostTable;
 
   if (comm->nRanks == 1 || info->func == ncclFuncAlltoAllPivot || info->func == ncclFuncAlltoAllGda || info->func == ncclFuncAlltoAllvGda) {
@@ -2317,20 +2318,6 @@ static ncclResult_t updateCollCostTable(
     /* Tree reduceScatter doesn't support scaling yet */
     if (a == NCCL_ALGO_PAT && info->func == ncclFuncReduceScatter
         && (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv)) continue;
-    if (a == NCCL_ALGO_PAT && (info->func == ncclFuncReduceScatter || info->func == ncclFuncAllGather)) {
-      if (!userAlgoInput) {
-        int nNodes = comm->nNodes;
-        bool inRange = false;
-        if (nNodes <= 4) {
-          inRange = (nBytes >= (512 << 10) && nBytes <= (2 << 20));
-        } else if (nNodes <= 8) {
-          inRange = (nBytes >= (32 << 10) && nBytes <= (4 << 20));
-        } else {
-          inRange = (nBytes <= (32 << 20));
-        }
-        if (!inRange) continue;
-      }
-    }
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
       if (p == NCCL_PROTO_LL128 && !(comm->topo->type & RCCL_TOPO_XGMI_ALL)) {
         table[a][p] = NCCL_ALGO_PROTO_IGNORE;
@@ -2442,18 +2429,8 @@ static ncclResult_t topoGetAlgoInfo(
     } else {
       nc = comm->nvlsChannels;
     }
-  } else if (info->algorithm == NCCL_ALGO_PAT) {
-    nc = (nBytes <= (32 << 10)) ? 1 : (nBytes <= (64 << 10)) ? 2 : (nBytes <= (1 << 20)) ? 4 : comm->nChannels;
-
-    int minNChannels = ncclParamMinNchannels();
-    int maxNChannels = ncclParamMaxNchannels();
-    if (minNChannels > 0) {
-      nc = std::max(minNChannels, nc);
-    }
-    if (maxNChannels > 0) {
-      nc = std::min(maxNChannels, nc);
-    }
   } else {
+    /* PAT: match upstream NCCL — use same channel tuning as ring/tree (no byte-rung ladder). */
     rcclUpdateThreadThreshold(comm, nBytes, info, threadThreshold);
     INFO(NCCL_TUNING, "pre-adjustment threadThreshold:%i nBytes:%lu nc:%i", threadThreshold, nBytes, nc);
 
