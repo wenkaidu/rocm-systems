@@ -14,6 +14,21 @@
 #include <iostream> //cerr
 #include <cstring>
 
+#ifdef __HIP_DEVICE_COMPILE__
+#if (defined(__gfx942__) || defined(__gfx950__)) && __has_builtin(__builtin_amdgcn_global_load_b128) && __has_builtin(__builtin_amdgcn_global_store_b128)
+#define RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS 1
+#pragma message "RCCL DWORDX4 Builtins Enabled on GFX942/GFX950"
+#else
+#define RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS 0
+#pragma message "RCCL DWORDX4 Builtins Disabled on GFX942/GFX950"
+#endif
+#else
+#define RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS 0
+#endif
+
+typedef __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int v4u;
+typedef __attribute__((address_space(1))) v4u* v4u_gptr;
+
 #define NUM_LOOPS_WARMUP 2000
 #define NUM_LOOPS_RUN 10000
 
@@ -33,6 +48,9 @@ union LLFifoLine {
   };
   uint64_t v[2];
   int4 i4;
+  #if defined(__HIP_DEVICE_COMPILE__) && RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  v4u v4u;  /* same layout as data1,flag1,data2,flag2 for b128 load/store */
+  #endif
 };
 
 #define HIP_IPC_MEM_MIN_SIZE (LL_MAX_THREADS*LL_MAX_LINES*sizeof(LLFifoLine))
@@ -43,8 +61,13 @@ __device__ void storeLL(union LLFifoLine* dst, uint64_t val, uint32_t flag) {
   i4.flag1 = flag;
   i4.data2 = (val >> 32);
   i4.flag2 = flag;
+  #if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  // System scope store that bypasses the hardware caches, should generate global_store_dwordx4 instruction with sc0 and sc1 bits set to 1 on gfx942/gfx950.
+  __builtin_amdgcn_global_store_b128((v4u_gptr) dst->v, i4.v4u, "");
+  #else
   __builtin_nontemporal_store(i4.v[0], dst->v);
   __builtin_nontemporal_store(i4.v[1], dst->v+1);
+  #endif
 }
 
 #define LL_SPINS_BEFORE_CHECK_ABORT 1000000
@@ -65,8 +88,12 @@ __device__ uint64_t readLL(union LLFifoLine* src, uint32_t flag, uint32_t* abort
 
   union LLFifoLine i4;
   do {
+    #if 0
+    i4.v4u = __builtin_amdgcn_global_load_b128((v4u_gptr)src->v, "");
+    #else
     i4.v[0] = __builtin_nontemporal_load(src->v);
     i4.v[1] = __builtin_nontemporal_load(src->v+1);
+    #endif
     if (checkAbort(spins, abortFlag)) break;
   } while ((i4.flag1 != flag) || (i4.flag2 != flag));
   uint64_t val64 = (uint64_t)(i4.data1) + (((uint64_t)i4.data2) << 32);
@@ -147,7 +174,7 @@ int main(int argc, char** argv) {
   HIPCHECK(hipStreamCreateWithFlags(&stream[0], hipStreamNonBlocking));
   HIPCHECK(hipDeviceEnablePeerAccess(device_id[1], 0));
   HIPCHECK(hipGetDeviceProperties(&prop[0], device_id[0]));
-  HIPCHECK(hipExtMallocWithFlags((void**)&flag[0], HIP_IPC_MEM_MIN_SIZE, (strncmp(prop[0].gcnArchName, "gfx942", 6) == 0 || strncmp(prop[0].gcnArchName, "gfx950", 6) == 0 || strncmp(prop[0].gcnArchName, "gfx1250", 7) == 0) ? hipDeviceMallocUncached : hipDeviceMallocFinegrained));
+  HIPCHECK(hipExtMallocWithFlags((void**)&flag[0], HIP_IPC_MEM_MIN_SIZE, hipDeviceMallocDefault));
   HIPCHECK(hipHostMalloc ((void**)&time_delta[0], sizeof(uint64_t), hipHostMallocDefault));
   HIPCHECK(hipMalloc((void**)&abortFlag[0], sizeof(uint32_t)));
   HIPCHECK(hipMemsetAsync(flag[0], 0, HIP_IPC_MEM_MIN_SIZE, stream[0]));
@@ -158,7 +185,7 @@ int main(int argc, char** argv) {
   HIPCHECK(hipStreamCreateWithFlags(&stream[1], hipStreamNonBlocking));
   HIPCHECK(hipDeviceEnablePeerAccess(device_id[0], 0));
   HIPCHECK(hipGetDeviceProperties(&prop[1], device_id[1]));
-  HIPCHECK(hipExtMallocWithFlags((void**)&flag[1], HIP_IPC_MEM_MIN_SIZE, (strncmp(prop[1].gcnArchName, "gfx942", 6) == 0 || strncmp(prop[1].gcnArchName, "gfx950", 6) == 0 || strncmp(prop[1].gcnArchName, "gfx1250", 7) == 0) ? hipDeviceMallocUncached : hipDeviceMallocFinegrained));
+  HIPCHECK(hipExtMallocWithFlags((void**)&flag[1], HIP_IPC_MEM_MIN_SIZE, hipDeviceMallocDefault));
   HIPCHECK(hipHostMalloc((void**)&time_delta[1], sizeof(uint64_t), hipHostMallocDefault));
   HIPCHECK(hipMalloc((void**)&abortFlag[1], sizeof(uint32_t)));
   HIPCHECK(hipMemsetAsync(flag[1], 0, HIP_IPC_MEM_MIN_SIZE, stream[1]));
