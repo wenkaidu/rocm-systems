@@ -1,9 +1,10 @@
 ---
 name: launch-rccl-tests-slurm
 description: >-
-  Run rccl-tests inside a SLURM allocation: quick sanity, single-node stress,
-  multi-node stress, soak loops, randomized alltoallv / P2P-channel trials, and
-  PAT-style all_gather_perf (1 rank per node, -g 1). Use when the user wants to drive *_perf binaries with srun (or mpirun) from a
+  Run rccl-tests inside a SLURM allocation or queue jobs via sbatch: quick sanity,
+  single-node stress, multi-node stress, soak loops, randomized alltoallv /
+  P2P-channel trials, and PAT-style all_gather_perf (1 rank per node, -g 1). Use
+  when the user wants to drive *_perf binaries with srun (or mpirun) from a
   non-interactive shell, without editing host lists by hand.
 disable-model-invocation: true
 ---
@@ -16,9 +17,11 @@ Export normal `NCCL_*` / `RCCL_*` tuning yourself before launching.
 
 ## Prerequisites
 
-- **SLURM allocation** for multi-node runs (`salloc` / `sbatch` / interactive
-  job). The scripts recover the nodelist from `SLURM_JOB_ID` when the shell only
-  inherited the job id (e.g. Cursor agent terminal).
+- **SLURM allocation** for multi-node runs (`salloc` / interactive `srun --pty`),
+  **or** use [scripts/submit_rccl_tests_slurm.sh](scripts/submit_rccl_tests_slurm.sh)
+  to **queue via `sbatch`** (no shell on compute nodes required). The runners
+  recover the nodelist from `SLURM_JOB_ID` when the shell only inherited the job
+  id (e.g. Cursor agent terminal).
 - **rccl-tests** `*_perf` binaries (default path `~/rocm-systems/projects/rccl-tests/build`).
 - **RCCL** shared library on `LD_LIBRARY_PATH` (default `~/rocm-systems/projects/rccl/build/release` and `.../lib` when present, via
   `RCCL_BUILD_DIR`).
@@ -38,6 +41,7 @@ Export normal `NCCL_*` / `RCCL_*` tuning yourself before launching.
 | [scripts/run_rccl_tests_alltoallv_p2p_channels_random.sh](scripts/run_rccl_tests_alltoallv_p2p_channels_random.sh) | **`alltoallv_perf`**: `COMBOS` trials (default 100) with random `NP` in `1..allocation` and random `NCCL_MAX_P2P_NCHANNELS` ∈ {1,2,4,8,16,32,64}; `NCCL_MIN_P2P_NCHANNELS=1`. |
 | [scripts/run_rccl_tests_pat_all_gather_1gpu_per_node.sh](scripts/run_rccl_tests_pat_all_gather_1gpu_per_node.sh) | **`all_gather_perf`**: **every allocated node**, one MPI rank per node (**`GPUS_PER_NODE=1`**, ignores preset **`NP`**), **`srun --nodes=$NNODES`**, **`-g 1`**; defaults **`NCCL_DEBUG=INFO`**, **`NCCL_DEBUG_SUBSYS=INIT,TUNING`** (algorithm lines), **`NCCL_PAT_ENABLE=1`**, **2 MiB** sweep (`-b 2M -e 2M`); override via **`PAT_ALLGATHER_ARGS`** / **`NCCL_PAT_ENABLE`**. |
 | [scripts/common_rccl_tests_slurm.sh](scripts/common_rccl_tests_slurm.sh) | Shared bash helpers (sourced by the runners). |
+| [scripts/submit_rccl_tests_slurm.sh](scripts/submit_rccl_tests_slurm.sh) | **`sbatch`** wrapper: queue any runner on `amd-rccl` (defaults match `srun --pty -N 2 -C block3\|block4 --ntasks-per-node=64 --gres=gpu:8 -p amd-rccl -t 4:00:00 --qos=urgent`). |
 
 ## Step 1: Allocation and paths
 
@@ -54,7 +58,34 @@ Request an allocation if needed, for example:
 
 ```bash
 salloc -N 2 --ntasks-per-node=8 --gpus-per-node=8 -t 4:00:00
+# or interactive (this site):
+srun --pty -N 2 -C "block3|block4" --ntasks-per-node=64 --gres=gpu:8 \
+  -p amd-rccl -t 4:00:00 --qos=urgent bash
 ```
+
+**Or queue a batch job** (no allocation in your shell):
+
+```bash
+# Quick all_reduce on 2 nodes (default)
+./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
+
+# PAT all_gather, 8 nodes, wait for completion
+SLURM_NNODES=8 \
+  RUN_SCRIPT=run_rccl_tests_pat_all_gather_1gpu_per_node.sh \
+  PAT_ALLGATHER_ARGS="-b 2M -e 128M -f 2 -g 1 -d bfloat16 -w 2 -n 5 -c 0" \
+  NCCL_PAT_ENABLE=1 NCCL_ALGO=PAT \
+  WAIT=1 \
+  ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
+
+# Multi-node stress sweep on 4 nodes
+SLURM_NNODES=4 RUN_SCRIPT=run_rccl_tests_stress_multi_node.sh \
+  ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
+```
+
+`submit_rccl_tests_slurm.sh` writes sbatch logs under `~/rccl_slurm_jobs/` by
+default. Override `SLURM_PARTITION`, `SLURM_QOS`, `SLURM_CONSTRAINT`, `SLURM_TIME`,
+etc. to match your account. Export `NCCL_*` / `RCCL_*` before submit — they are
+forwarded into the batch step.
 
 ## Step 2: Cluster tuning (your responsibility)
 
