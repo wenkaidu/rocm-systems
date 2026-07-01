@@ -12,12 +12,26 @@
 #include "op128.h"
 #include "nccl_device/utility.h"
 #include "reduce_kernel.h"
+#include "amd_tdm.h"
 #include <cstdio>
 #include <cstdint>
 
 #include <hip/hip_runtime.h>
 
 #define __syncwarp()
+
+// Per-warp LDS staging tile used by the gfx1250 TDM copy path. A copy is
+// staged global -> LDS -> global one tile at a time; this is the tile size.
+// Bounded so total staging LDS = (NCCL_MAX_NTHREADS/WARP_SIZE)*RCCL_TDM_TILE_BYTES
+// and each tile fits the descriptor's 16-bit extent field.
+#ifndef RCCL_TDM_TILE_BYTES
+#define RCCL_TDM_TILE_BYTES 2048
+#endif
+
+// Minimum transfer size before the TDM copy path is worth its LDS round-trip.
+#ifndef RCCL_TDM_MIN_BYTES
+#define RCCL_TDM_MIN_BYTES (2*RCCL_TDM_TILE_BYTES)
+#endif
 
 // Define min for ssize_t
 inline __device__ int min(int a, ssize_t b) { return (a < b) ? a : b; }
@@ -202,6 +216,65 @@ __device__ __forceinline__ static void reduceCopyPacks(
   // This effectively assigns: warp = (warp-nHunks+nWarps)%nWarps;
   warp = -nHunksAhead;
   thread = warp*WARP_SIZE + lane;
+}
+
+// Per-warp view into the block-wide TDM staging buffer. Non-templated so a
+// single __shared__ allocation is shared by every reduceCopyPacksTdm
+// instantiation compiled into the kernel (rather than one per type).
+__device__ __forceinline__ char* ncclTdmStageForWarp(int warp) {
+  __shared__ char tdmStage[(NCCL_MAX_NTHREADS/WARP_SIZE) * RCCL_TDM_TILE_BYTES];
+  return tdmStage + warp*RCCL_TDM_TILE_BYTES;
+}
+
+// Copy-only TDM variant of reduceCopyPacks: moves the whole [nBytesBehind,
+// nBytesBehind+nBytesAhead) range from the single source to the single
+// destination using the AMD Tensor Data Mover, staging through LDS
+// (global -> LDS -> global). This is only valid for a pure copy: one src,
+// one dst, no multimem / preop / postop / accumulate (the caller guarantees
+// this via the dispatch condition in reduceCopy).
+//
+// Warps stripe over the buffer: warp w owns the tiles at byte offsets
+// w*Tile, (w+nWarps)*Tile, ... Each tile is a wave-issued bulk load followed
+// by a bulk store, each drained with TENSORcnt. On return the whole range is
+// consumed (nBytesAhead == 0). No workgroup barrier is used, so warps may run
+// a different number of tiles without deadlocking.
+template<typename RedFn, typename T, int Unroll, int BytePerPack,
+         int MultimemSrcs, int MinSrcs, int MaxSrcs,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
+__device__ __forceinline__ static void reduceCopyPacksTdm(
+    int nThreads, int &thread,
+    int nSrcs, SrcPtrFn const &srcPtrFn, int nDsts, DstPtrFn const &dstPtrFn,
+    IntBytes &nBytesBehind, IntBytes &nBytesAhead
+  ) {
+  static_assert(std::is_signed<IntBytes>::value, "IntBytes must be a signed integral type.");
+  constexpr IntBytes Tile = RCCL_TDM_TILE_BYTES;
+
+  int nWarps = nThreads/WARP_SIZE;
+  int warp = thread/WARP_SIZE;
+  char* stage = ncclTdmStageForWarp(warp);
+
+  const uintptr_t src = cvta_to_global(srcPtrFn(0)) + nBytesBehind;
+  const uintptr_t dst = cvta_to_global(dstPtrFn(0)) + nBytesBehind;
+  const IntBytes nBytes = nBytesAhead;
+
+  for (IntBytes off = (IntBytes)warp*Tile; off < nBytes; off += (IntBytes)nWarps*Tile) {
+    const IntBytes rem = nBytes - off;
+    const uint32_t chunk = (uint32_t)(rem < Tile ? rem : Tile);
+
+    // global(src) -> LDS
+    amd_tdm::cp_async_bulk(amd_tdm::space_shared, amd_tdm::space_global,
+                           stage, reinterpret_cast<const void*>(src + off), chunk);
+    amd_tdm::cp_async_bulk_wait_group_read(amd_tdm::n32_t<0>());
+    // LDS -> global(dst)
+    amd_tdm::cp_async_bulk(amd_tdm::space_global, amd_tdm::space_shared,
+                           reinterpret_cast<void*>(dst + off), stage, chunk);
+    amd_tdm::cp_async_bulk_wait_group_read(amd_tdm::n32_t<0>());
+  }
+
+  // The entire range is now copied.
+  nBytesBehind += nBytes;
+  nBytesAhead = 0;
 }
 
 template <typename RedFn, typename SrcPtrFn, typename IntBytes, int MultimemSrcs, int MinSrcs, int MaxSrcs, int PreOpSrcs, int Unroll, int BytePerPack>
@@ -618,6 +691,30 @@ __device__ __forceinline__ void reduceCopy(
   IntBytes nBytesBehind = 0;
   IntBytes nBytesAhead = nElts*sizeof(T);
   //bool useAcc = accPtrFn() != nullptr;
+
+  // gfx1250 Tensor Data Mover copy path. Only a pure single-src -> single-dst
+  // copy (no multimem / preop / postop / accumulate) can be offloaded to the
+  // TDM engine, which stages through LDS. Everything else falls through to the
+  // vector-unit paths below. Guarded by if constexpr so it is only instantiated
+  // for that shape on gfx1250 (amd_tdm::available()).
+  if constexpr (amd_tdm::available() &&
+                MultimemSrcs == 0 && MultimemDsts == 0 &&
+                MinSrcs == 1 && MaxSrcs == 1 &&
+                MinDsts == 1 && MaxDsts == 1 &&
+                PreOpSrcs == 0 && !useAcc) {
+    if (!postOp && nSrcs == 1 && nDsts == 1 &&
+        nBytesAhead >= (IntBytes)RCCL_TDM_MIN_BYTES) {
+      uintptr_t s0 = cvta_to_global(srcPtrFn(0));
+      uintptr_t d0 = cvta_to_global(dstPtrFn(0));
+      if (((s0 | d0) & 0xF) == 0) {  // 16B-aligned bases
+        reduceCopyPacksTdm<RedFn, T, Unroll, /*BytePerPack=*/16,
+          MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+          (nThreads, thread, nSrcs, srcPtrFn, nDsts, dstPtrFn, nBytesBehind, nBytesAhead);
+        if (nBytesAhead == 0) return;
+      }
+    }
+  }
+
   // For Dword or larger reads or writes, the two LSBs of the byte-address are ignored, thus forcing Dword
   // alignment.
   constexpr int AlignedPathPackSize = 4;
