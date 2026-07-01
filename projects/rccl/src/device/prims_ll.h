@@ -29,6 +29,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload, Metadata, Pi
   const int stepLines;
   Fan fan;
   T *userBufs[3];
+  bool userRegUsed = false; // runtime: user buffer registration in use -> keep cache-bypass
   struct ncclConnInfo* recvConn = NULL;
   volatile uint64_t* recvConnHeadPtr = NULL;
   uint64_t recvConnHead;
@@ -167,9 +168,11 @@ private:
 #ifdef __GFX11__
       asm volatile ("global_load_b128 %0, %1, off glc slc dlc\n"
         "s_waitcnt vmcnt(0)\n" : "=v"(i4.i4) : "v"(&src->i4));
-#elif RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
-      i4.v4u = __builtin_amdgcn_global_load_b128((v4u_gptr)src->v, RCCL_SYSTEM_SYNCSCOPE);
 #else
+      // Comm FIFO lines only need cross-GPU visibility (peer writes land in L2),
+      // which the register-friendly non-temporal path already provides. On gfx9
+      // this is faster than the system-scope cache-bypass builtins, so use it
+      // unconditionally here (registration only affects user buffers, see load()).
       *((u64_gptr)i4.v) = __builtin_nontemporal_load((u64_gptr)src->v);
       *((u64_gptr)i4.v + 1) = __builtin_nontemporal_load((u64_gptr)src->v+1);
 #endif
@@ -212,9 +215,8 @@ private:
 #ifdef __GFX11__
         asm volatile ("global_load_b128 %0, %1, off glc slc dlc\n"
           "s_waitcnt vmcnt(0)\n" : "=v"(line[i].i4) : "v"(&src->i4));
-#elif RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
-        line[i].v4u = __builtin_amdgcn_global_load_b128((v4u_gptr)src->v, RCCL_SYSTEM_SYNCSCOPE);
 #else
+        // Comm FIFO line: non-temporal is sufficient and faster on gfx9 (see readLL).
         line[i].v[0] = __builtin_nontemporal_load(src->v);
         line[i].v[1] = __builtin_nontemporal_load(src->v+1);
 #endif
@@ -241,9 +243,8 @@ private:
 #ifdef __GFX11__
       asm volatile ("global_load_b128 %0, %1, off glc slc dlc\n"
         "s_waitcnt vmcnt(0)\n" : "=v"(line[i].i4) : "v"(&src->i4));
-#elif RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
-      line[i].v4u = __builtin_amdgcn_global_load_b128((v4u_gptr)src->v, RCCL_SYSTEM_SYNCSCOPE);
 #else
+      // Comm FIFO line: non-temporal is sufficient and faster on gfx9 (see readLL).
       line[i].v[0] = __builtin_nontemporal_load((u64_gptr)src->v);
       line[i].v[1] = __builtin_nontemporal_load((u64_gptr)src->v+1);
 #endif
@@ -275,8 +276,10 @@ private:
     i4.data2 = (val >> 32);
     i4.flag2 = flag;
     #if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
-    // System scope store that bypasses the hardware caches, should generate global_store_dwordx4 instruction with sc0 and sc1 bits set to 1 on gfx942/gfx950.
-    __builtin_amdgcn_global_store_b128((v4u_gptr) dst->v, i4.v4u, RCCL_SYSTEM_SYNCSCOPE);
+    // Comm FIFO store: non-temporal is sufficient for peer visibility and faster
+    // than the system-scope cache-bypass builtin on gfx9 (see readLL).
+    __builtin_nontemporal_store(*((u64_gptr) i4.v),   (u64_gptr) dst->v);
+    __builtin_nontemporal_store(*((u64_gptr) i4.v+1), (u64_gptr) dst->v+1);
     #else
     *((u64_gptr) dst->v) = *((u64_gptr) i4.v);
     *((u64_gptr) dst->v+1) = *((u64_gptr) i4.v+1);
@@ -292,7 +295,7 @@ private:
   static constexpr int EltPerLine = sizeof(uint64_t)/sizeof(T);
 
   template<typename U>
-  __device__ static U load(U *src) {
+  __device__ static U load(U *src, bool regUsed) {
     union {
       U elt;
       uint8_t u1;
@@ -302,6 +305,11 @@ private:
     };
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+    // User buffer read. Only registered user buffers (Direct-capable collectives
+    // with regUsed at runtime) need the system-scope cache-bypass for coherence;
+    // everything else uses the faster non-temporal path. `Direct` is compile-time,
+    // so for Direct==0 instantiations the bypass path folds away entirely.
+    if (Direct != 0 && regUsed) {
     if(sizeof(U) == 1)
       u1 = __hip_atomic_load((__attribute__((address_space(1))) uint8_t*)src, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     else if(sizeof(U) == 2)
@@ -310,6 +318,16 @@ private:
       u4 = __hip_atomic_load((__attribute__((address_space(1))) uint32_t*)src, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     else
       u8 = __hip_atomic_load((__attribute__((address_space(1))) uint64_t*)src, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    } else {
+    if(sizeof(U) == 1)
+      u1 = __builtin_nontemporal_load((u8_gptr)src);
+    else if(sizeof(U) == 2)
+      u2 = __builtin_nontemporal_load((u16_gptr)src);
+    else if(sizeof(U) == 4)
+      u4 = __builtin_nontemporal_load((u32_gptr)src);
+    else
+      u8 = __builtin_nontemporal_load((u64_gptr)src);
+    }
 #else
     if(sizeof(U) == 1)
 #ifdef __GFX11__
@@ -402,14 +420,14 @@ private:
       T elt[EltPerLine];
     };
 
-    __device__ void loadBegin(T *src, int eltN) {
+    __device__ void loadBegin(T *src, int eltN, bool regUsed) {
       if (sizeof(T) <= 2) {
         misalign = reinterpret_cast<uintptr_t>(src)%4;
         uint32_t *p = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(src) & -uintptr_t(4));
-        u4[0] = load(p+0);
-        u4[1] = misalign + eltN*sizeof(T) > 4 ? load(p+1) : 0;
+        u4[0] = load(p+0, regUsed);
+        u4[1] = misalign + eltN*sizeof(T) > 4 ? load(p+1, regUsed) : 0;
         // u4[2] would be simpler, but that throws warnings on some compilers
-        u4[sizeof(T) <= 2 ? 2 : 0] = misalign + eltN*sizeof(T) > 8 ? load(p+2) : 0;
+        u4[sizeof(T) <= 2 ? 2 : 0] = misalign + eltN*sizeof(T) > 8 ? load(p+2, regUsed) : 0;
       }
       else {
         #pragma unroll
@@ -417,7 +435,7 @@ private:
           // Yes, for some template arguments this code will be unreachable.  That's fine.
           // coverity[dead_error_line]
           if(i==0 || i < eltN)
-            elt[i] = load(src + i);
+            elt[i] = load(src + i, regUsed);
         }
       }
     }
@@ -494,7 +512,7 @@ private:
       ncclLLFifoLine line[MaxRecv];
       uint64_t data, peerData, accData;
       if (SRC) {
-        dl.loadBegin(srcElts, eltInLine);
+        dl.loadBegin(srcElts, eltInLine, userRegUsed);
         srcElts += eltPerTrip;
       }
       if (RECV) {
@@ -528,7 +546,7 @@ private:
       }
       if (DST) {
         if (accElts != nullptr) {
-          accdl.loadBegin(accElts, eltInLine);
+          accdl.loadBegin(accElts, eltInLine, userRegUsed);
           accElts += eltPerTrip;
           accData = accdl.loadFinish();
           storeData(dstElts, applyReduce(redOp, accData, data), eltInLine);
@@ -714,6 +732,7 @@ public:
     loadRecvSync();
     // coverity[var_deref_model:FALSE]
     loadSendSync();
+    userRegUsed = (e != nullptr) && (e->regUsed || e->netRegUsed);
     setDataPtrs(inputBuf, outputBuf, e != nullptr ? e->acc : nullptr);
   }
 
