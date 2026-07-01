@@ -21,19 +21,16 @@ THE SOFTWARE.
 */
 
 // =====================================================================
-// TdmTest - exercises the AMD Tensor Data Mover (TDM) *tensor-descriptor*
-// path on gfx1250 via __builtin_amdgcn_tensor_load_to_lds /
-// __builtin_amdgcn_tensor_store_from_lds.
+// TdmTest - exercises the AMD Tensor Data Mover (TDM) through the
+// cp.async.bulk-style amd_tdm.h API, which mirrors the CUDA / CCCL
+// `cuda::ptx` bulk-copy intrinsics and lowers to
+// __builtin_amdgcn_tensor_load_to_lds / tensor_store_from_lds.
 //
-// Unlike the per-lane async LDS-DMA path, a TDM tensor op is issued once per
-// wave and moves an entire 2D tile (box) described by a hardware descriptor.
-// The descriptor is built on-device with ck_tile::createTDMDescriptor (the
-// authoritative encoder shipped in the ROCm toolchain), and its five chunks
-// D0..D4 are fed to the builtins. TENSORcnt (s_wait_tensorcnt) tracks
-// completion.
-//
-// The kernel copies one rows x cols float tile:
-//     global(in) --tensor_load_to_lds--> LDS --tensor_store_from_lds--> global(out)
+// The kernel bulk-copies one contiguous buffer global(in) -> LDS -> global(out):
+//     cp_async_bulk(space_shared, space_global, lds, in,  bytes)   // g->s load
+//     cp_async_bulk_wait_group_read(n32_t<0>())                    // drain
+//     cp_async_bulk(space_global, space_shared, out, lds, bytes)   // s->g store
+//     cp_async_bulk_wait_group_read(n32_t<0>())                    // drain
 // and the host verifies out == in.
 //
 // TDM is gfx1250-only, so real work happens only when built with
@@ -43,9 +40,7 @@ THE SOFTWARE.
 
 #include <hip/hip_runtime.h>
 
-#if defined(__gfx1250__)
-#include "ck_tile/core/arch/amd_tdm_descriptor.hpp"
-#endif
+#include "amd_tdm.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -65,52 +60,31 @@ THE SOFTWARE.
 static constexpr int kWave = 32;   // gfx1250 is wave32; tensor DMA needs wave32
 
 // ---------------------------------------------------------------------
-// One wave copies a rows x cols tile: global(in) -> LDS -> global(out)
-// using the TDM tensor-descriptor builtins.
+// One wave bulk-copies a contiguous buffer: global(in) -> LDS -> global(out)
+// using the cp.async.bulk-style amd_tdm API.
 // ---------------------------------------------------------------------
-#if defined(__gfx1250__)
 __global__ void tdmTensorRoundTrip(const float* __restrict__ in,
                                    float* __restrict__ out,
                                    int rows, int cols) {
-  extern __shared__ float lds[];
-
-  // Contiguous row-major rows x cols tensor; the whole tensor is one tile.
-  uint32_t globalDim[2] = { static_cast<uint32_t>(rows), static_cast<uint32_t>(cols) };
-  uint64_t globalStr[2] = { static_cast<uint64_t>(cols), 1ull };  // element strides
-  uint16_t boxDim[2]    = { static_cast<uint16_t>(rows), static_cast<uint16_t>(cols) };
-
-  ck_tile::TDMConfig cfg{};   // defaults: not-restore, no barrier/iterate/pad
+  extern __shared__ char lds[];
+  const uint32_t bytes = static_cast<uint32_t>(rows) * cols * sizeof(float);
 
   // ---- global(in) -> LDS ----
-  {
-    auto desc = ck_tile::createTDMDescriptor<float, 2>(
-        static_cast<const void*>(in), static_cast<void*>(lds),
-        globalDim, globalStr, boxDim, cfg);
-    auto g = desc.getResourceDescriptorGroup();
-    __builtin_amdgcn_tensor_load_to_lds(
-        g.get(ck_tile::number<0>{}), g.get(ck_tile::number<1>{}),
-        g.get(ck_tile::number<2>{}), g.get(ck_tile::number<3>{}),
-        g.get(ck_tile::number<4>{}), /*cpol*/ 0);
-  }
-  __builtin_amdgcn_s_wait_tensorcnt(0);   // load complete: data in LDS
-  __builtin_amdgcn_s_barrier();           // LDS visibility before store reads it
+  amd_tdm::cp_async_bulk(amd_tdm::space_shared, amd_tdm::space_global,
+                         lds, in, bytes);
+  amd_tdm::cp_async_bulk_commit_group();
+  amd_tdm::cp_async_bulk_wait_group_read(amd_tdm::n32_t<0>());  // data in LDS
+
+#if defined(__gfx1250__)
+  __builtin_amdgcn_s_barrier();     // LDS visibility before store reads it
+#endif
 
   // ---- LDS -> global(out) ----
-  {
-    auto desc = ck_tile::createTDMDescriptor<float, 2>(
-        static_cast<const void*>(out), static_cast<void*>(lds),
-        globalDim, globalStr, boxDim, cfg);
-    auto g = desc.getResourceDescriptorGroup();
-    __builtin_amdgcn_tensor_store_from_lds(
-        g.get(ck_tile::number<0>{}), g.get(ck_tile::number<1>{}),
-        g.get(ck_tile::number<2>{}), g.get(ck_tile::number<3>{}),
-        g.get(ck_tile::number<4>{}), /*cpol*/ 0);
-  }
-  __builtin_amdgcn_s_wait_tensorcnt(0);   // store complete: data in global
+  amd_tdm::cp_async_bulk(amd_tdm::space_global, amd_tdm::space_shared,
+                         out, lds, bytes);
+  amd_tdm::cp_async_bulk_commit_group();
+  amd_tdm::cp_async_bulk_wait_group_read(amd_tdm::n32_t<0>());  // data in global
 }
-#else
-__global__ void tdmTensorRoundTrip(const float*, float*, int, int) {}
-#endif
 
 static bool deviceSupportsTdm() {
   hipDeviceProp_t prop{};

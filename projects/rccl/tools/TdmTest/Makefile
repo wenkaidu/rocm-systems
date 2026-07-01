@@ -9,7 +9,9 @@ OFFLOAD_ARCH ?= gfx1250
 
 EXE := TdmTest
 
-CXXFLAGS := --offload-arch=$(OFFLOAD_ARCH) -O3 -std=c++20 -I$(ROCM_PATH)/include
+# amd_tdm.h lives in the RCCL device sources; ck_tile ships in the ROCm tree.
+CXXFLAGS := --offload-arch=$(OFFLOAD_ARCH) -O3 -std=c++20 \
+            -I$(ROCM_PATH)/include -I../../src/device
 
 all: $(EXE)
 
