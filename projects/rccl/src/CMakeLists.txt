@@ -50,6 +50,7 @@ set(SRC_FILES
   device/alltoall_pivot.h
   device/alltoall_gda.h
   device/alltoallv_gda.h
+  device/amd_tdm.h
   device/broadcast.h
   device/common.h
   device/common_kernel.h
