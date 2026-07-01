@@ -20,6 +20,22 @@
 #endif
 #endif
 
+// Non-temporal 128-bit load/store for LL128 communication (FIFO) buffers.
+// Comm buffers are already allocated uncached, so there is no cache to bypass;
+// using the plain non-temporal path here (the pre-cache-bypass behavior) avoids
+// the extra register pressure that the system-scope global_load/store_b128
+// builtins introduce in the LL128 reduce kernels. The cache-bypassing load128/
+// store128 remain in use for user buffers (loadRegsBegin/storeRegs).
+inline __device__ void load128NT(const uint64_t* ptr, uint64_t &v0, uint64_t &v1) {
+  v0 = __builtin_nontemporal_load((u64_gptr) ptr);
+  v1 = __builtin_nontemporal_load((u64_gptr) ptr+1);
+}
+
+inline __device__ void store128NT(uint64_t* ptr, uint64_t v0, uint64_t v1) {
+  __builtin_nontemporal_store(v0, (u64_gptr) ptr);
+  __builtin_nontemporal_store(v1, (u64_gptr) ptr + 1);
+}
+
 template<typename T, typename RedOp, typename Fan, int Direct, int P2p, bool isNetOffload, int Metadata, int Pipeline, int useAcc>
 class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload, Metadata, Pipeline, useAcc>:
   public PrimitivesWithoutDirect<Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload, Metadata, Pipeline, useAcc>> {
@@ -38,6 +54,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload, Metadata,
   const int threadsPerBlock;
   Fan fan;
   T *userBufs[3];
+  bool userRegUsed = false; // runtime: user buffers registered (cacheable) -> need cache-bypass
   struct ncclConnInfo* recvConn = NULL;
   volatile uint64_t* recvConnHeadPtr = NULL;
   uint64_t recvConnHead;
@@ -151,6 +168,24 @@ private:
     }
   }
 
+  // User-buffer 128-bit access mode selection.
+  // Cache-bypassing (system-scope) loads/stores are only required when this op
+  // accesses a registered, potentially-cached user buffer directly. That needs
+  // both Direct != 0 (compile-time: this instantiation supports direct access)
+  // and work->regUsed (runtime: registration is actually in use). Otherwise the
+  // user buffer is reached only through the uncached comm staging, so the
+  // register-friendly non-temporal path is correct and avoids the system-scope
+  // ordering constraints that force AGPR/scratch spills.
+  // When Direct == 0 the condition folds away at compile time (no branch, no
+  // member read); when Direct != 0 it becomes a uniform, loop-invariant branch
+  // on userRegUsed.
+  __device__ __forceinline__ void loadUser128(const uint64_t* ptr, uint64_t &v0, uint64_t &v1) {
+    if (Direct && userRegUsed) load128(ptr, v0, v1); else load128NT(ptr, v0, v1);
+  }
+  __device__ __forceinline__ void storeUser128(uint64_t* ptr, uint64_t v0, uint64_t v1) {
+    if (Direct && userRegUsed) store128(ptr, v0, v1); else store128NT(ptr, v0, v1);
+  }
+
   template<int WordPerThread>
   __device__ __forceinline__ void loadRegsBegin(uint64_t(&regs)[WordPerThread], T const *src, int eltN) {
     constexpr int EltPer16B = 16/sizeof(T);
@@ -170,7 +205,7 @@ private:
       for(int g=0; g < WordPerThread/2; g++) {
         if(!flagThread || g%2==0) {
           if(ix[g]*EltPer16B < eltN)
-            load128((uint64_t*)(src + ix[g]*EltPer16B), regs[2*g+0], regs[2*g+1]);
+            loadUser128((uint64_t*)(src + ix[g]*EltPer16B), regs[2*g+0], regs[2*g+1]);
         }
       }
     }
@@ -183,7 +218,7 @@ private:
       #pragma unroll
       for(int g=0; g < WordPerThread/2; g++)
         if((g*WARP_SIZE + wid)*16 < misalignment + eltN*sizeof(T))
-          load128(src8 + 2*(g*WARP_SIZE + wid), regs[2*g+0], regs[2*g+1]);
+          loadUser128(src8 + 2*(g*WARP_SIZE + wid), regs[2*g+0], regs[2*g+1]);
       #pragma unroll
       for(int g=0; g < WordPerThread/2; g++)
         storeShmem128(shm8 + 2*(g*WARP_SIZE + wid), regs[2*g+0], regs[2*g+1]);
@@ -230,7 +265,7 @@ private:
       int ix = g*WARP_SIZE - 16*(g/2) + wid - (g%2)*(wid/4);
       if (!flagThread || g%2==0) {
         if(misalignment == 0 && (ix+1)*EltPer16B <= eltN)
-          store128((uint64_t*)(dst + ix*EltPer16B), regs[2*g+0], regs[2*g+1]);
+          storeUser128((uint64_t*)(dst + ix*EltPer16B), regs[2*g+0], regs[2*g+1]);
         else
           storeShmem128(shm8+2*ix, regs[2*g+0], regs[2*g+1]);
       }
@@ -262,14 +297,14 @@ private:
         needReload = false;
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
-          load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
+          load128NT(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
           needReload |= flagThread && (vr[u+1] != flag);
         }
         needReload &= (0 == checkAbort(abort, 1, spins));
       } while (__any(needReload));
       #pragma unroll
       for (int u=0; u<ELEMS_PER_THREAD; u+=2)
-        load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
+        load128NT(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
     }
 
     /************* Finish register load **************/
@@ -308,7 +343,7 @@ private:
           needReload = false;
           #pragma unroll
           for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
-            load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
+            load128NT(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
             needReload |= flagThread && (vr[u+1] != flag);
           }
           needReload &= (0 == checkAbort(abort, 1, spins));
@@ -316,7 +351,7 @@ private:
 
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2)
-          load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
+          load128NT(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
 
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
@@ -347,14 +382,14 @@ private:
         uint64_t* ptr = sendPtr(i)+ll128Offset;
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
-          store128(ptr+u*WARP_SIZE, v[u], flagThread ? flag : v[u+1]);
+          store128NT(ptr+u*WARP_SIZE, v[u], flagThread ? flag : v[u+1]);
         }
       }
       uint64_t flag = sendFlag(0);
       uint64_t* ptr = sendPtr(0)+ll128Offset;
       #pragma unroll
       for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
-        store128(ptr+u*WARP_SIZE, v[u], flagThread ? flag : v[u+1]);
+        store128NT(ptr+u*WARP_SIZE, v[u], flagThread ? flag : v[u+1]);
       }
     }
     /********************** End Send ************************/
@@ -601,6 +636,7 @@ public:
     loadRecvSync();
     // coverity[var_deref_model:FALSE]
     loadSendSync();
+    userRegUsed = (e != nullptr) && (e->regUsed || e->netRegUsed);
     setDataPtrs(inputBuf, outputBuf, e != nullptr ? e->acc : nullptr);
   }
 
