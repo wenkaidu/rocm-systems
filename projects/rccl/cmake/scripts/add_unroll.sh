@@ -37,6 +37,54 @@ if [[ "$HIP_FILE" =~ .*/src/device/.*\.h ]]; then
   perl -pi -e 's/(runRing<T, RedOp, Proto, USE_ACC, COLL_UNROLL.*?)>/\1, Pipeline>/' "$HIP_FILE"
   perl -pi -e 's/(runTreeSplit<T, RedOp, Proto, USE_ACC, COLL_UNROLL.*?)>/\1, Pipeline>/' "$HIP_FILE"
   perl -pi -e 's/(runTreeUpDown<T, RedOp, Proto, USE_ACC, COLL_UNROLL.*?)>/\1, Pipeline>/' "$HIP_FILE"
-  sed -i "s/\\(struct RunWorkBatch<ncclFunc[^>]*\\)>*/\\1, USE_ACC, COLL_UNROLL, Pipeline>/" "$HIP_FILE"
-  sed -i "s/\\(RunWorkColl<[^,]*,[^,]*,[^,]*,[^,]*,[^>]*\\)>/\\1, USE_ACC, COLL_UNROLL, Pipeline>/" "$HIP_FILE"
+  sed -i "s/\\(struct RunWorkBatch<ncclFunc[^>]*\\)>*/\\1, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>/" "$HIP_FILE"
+  sed -i "s/\\(RunWorkColl<[^,]*,[^,]*,[^,]*,[^,]*,[^>]*\\)>/\\1, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>/" "$HIP_FILE"
+
+  # Declare the UserRegMode template parameter on RunWorkColl / RunWorkBatch
+  # partial specialization headers (those immediately followed by a
+  # `struct RunWork...`). Partial specializations may not carry default template
+  # arguments, so this is added without a default (the primary templates in
+  # common.h provide the default). Must run after the USE_ACC/COLL_UNROLL/Pipeline
+  # header expansion above.
+  perl -0777 -pi -e 's/(template<typename T, typename RedOp, int USE_ACC, int COLL_UNROLL, int Pipeline)>(\s*\nstruct RunWork)/\1, int UserRegMode>\2/g' "$HIP_FILE"
+
+  # Thread a compile-time UserRegMode parameter onto runRing so LL/LL128 can select
+  # their user-buffer access path (0=runtime, 1=registered, 2=non-registered)
+  # without a runtime dual code path. Append it (defaulted) to every (already
+  # expanded) runRing/runTree header, right after the Pipeline / isNetOffload tail.
+  perl -pi -e 's/(template<typename T, typename RedOp, typename Proto[^>]*int Pipeline[^>]*)>/\1, int UserRegMode = 0>/g' "$HIP_FILE"
+
+  # Expand the registered / non-registered dispatch helpers into the corresponding
+  # runRing instantiation (Pipeline is always 0 for LL). The template argument
+  # list must match each collective's (transformer-expanded) runRing header:
+  #   all_reduce : <T, RedOp, Proto, RCCLMetadata, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>
+  #   all_gather : <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, isNetOffload, UserRegMode>
+  #   broadcast  : <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>
+  # NB: LL128 keeps the single UserRegMode=0 runtime path (no reg/noreg split);
+  # splitting it isolates a registered specialization the compiler spills to AGPR,
+  # which dominates the shared kernel's register reservation and hurts occupancy.
+  perl -pi -e 's/runLLRingReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, RCCL_METADATA_EMPTY, USE_ACC, COLL_UNROLL, 0, 1>(/g' "$HIP_FILE"
+  perl -pi -e 's/runLLRingNoReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, RCCL_METADATA_EMPTY, USE_ACC, COLL_UNROLL, 0, 2>(/g' "$HIP_FILE"
+  perl -pi -e 's/runAGRingReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, false, 1>(/g' "$HIP_FILE"
+  perl -pi -e 's/runAGRingNoReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, false, 2>(/g' "$HIP_FILE"
+  perl -pi -e 's/runBcastRingReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 1>(/g' "$HIP_FILE"
+  perl -pi -e 's/runBcastRingNoReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 2>(/g' "$HIP_FILE"
+
+  # AllReduce tree (LL) split: runTreeSplit header expands to
+  #   <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode> (Pipeline=0 for LL).
+  perl -pi -e 's/runTreeSplitLLReg<T, RedOp>\(/runTreeSplit<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 1>(/g' "$HIP_FILE"
+  perl -pi -e 's/runTreeSplitLLNoReg<T, RedOp>\(/runTreeSplit<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 2>(/g' "$HIP_FILE"
+
+  # LL128 reg/noreg split: unlike LL (which selects at runtime inside one kernel),
+  # LL128 is generated as two separate kernels (see generate.py). The RunWorkColl
+  # specialization is instantiated per UserRegMode, so these dispatch helpers just
+  # forward the compile-time UserRegMode template parameter into runRing/runTreeSplit.
+  #   all_reduce ring : <T, RedOp, Proto, RCCLMetadata, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>
+  #   all_reduce tree : <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>
+  #   all_gather ring : <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, isNetOffload, UserRegMode>
+  #   broadcast  ring : <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>
+  perl -pi -e 's/runARRingLL128<T, RedOp>\(/runRing<T, RedOp, ProtoLL128, RCCL_METADATA_EMPTY, USE_ACC, COLL_UNROLL, 0, UserRegMode>(/g' "$HIP_FILE"
+  perl -pi -e 's/runARTreeLL128<T, RedOp>\(/runTreeSplit<T, RedOp, ProtoLL128, USE_ACC, COLL_UNROLL, 0, UserRegMode>(/g' "$HIP_FILE"
+  perl -pi -e 's/runAGRingLL128<T, RedOp>\(/runRing<T, RedOp, ProtoLL128, USE_ACC, COLL_UNROLL, 0, false, UserRegMode>(/g' "$HIP_FILE"
+  perl -pi -e 's/runBcastRingLL128<T, RedOp>\(/runRing<T, RedOp, ProtoLL128, USE_ACC, COLL_UNROLL, 0, UserRegMode>(/g' "$HIP_FILE"
 fi

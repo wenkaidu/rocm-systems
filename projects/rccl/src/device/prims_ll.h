@@ -11,9 +11,9 @@
 #endif
 
 #include "device/rccl_ptr.h"
-template<typename T, typename RedOp, typename Fan, int Direct, int P2p, bool isNetOffload, int Metadata, int Pipeline, int useAcc>
-class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload, Metadata, Pipeline, useAcc>:
-    public PrimitivesWithoutDirect<Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload, Metadata, Pipeline, useAcc>> {
+template<typename T, typename RedOp, typename Fan, int Direct, int P2p, bool isNetOffload, int Metadata, int Pipeline, int useAcc, int UserRegMode>
+class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload, Metadata, Pipeline, useAcc, UserRegMode>:
+    public PrimitivesWithoutDirect<Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload, Metadata, Pipeline, useAcc, UserRegMode>> {
 
   // In the case of Fan::MaxRecv == 0, we need to force MaxRecv to 1 for this to compile
   // This is because of a recv buffer which is allocated to MaxRecv length in send-only cases
@@ -306,10 +306,14 @@ private:
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
     // User buffer read. Only registered user buffers (Direct-capable collectives
-    // with regUsed at runtime) need the system-scope cache-bypass for coherence;
-    // everything else uses the faster non-temporal path. `Direct` is compile-time,
-    // so for Direct==0 instantiations the bypass path folds away entirely.
-    if (Direct != 0 && regUsed) {
+    // with registration in use) need the system-scope cache-bypass for coherence;
+    // everything else uses the faster non-temporal path.
+    // Registration can be known at compile time via the UserRegMode class template
+    // parameter (0=runtime via regUsed, 1=forced registered, 2=forced
+    // non-registered). For UserRegMode==2 (or Direct==0) the system-scope branch
+    // folds away entirely, giving a clean single-path kernel with no dead
+    // cache-bypass code (matching the pre-cache-bypass register pressure).
+    if ((Direct != 0) && (UserRegMode == 1 || (UserRegMode == 0 && regUsed))) {
     if(sizeof(U) == 1)
       u1 = __hip_atomic_load((__attribute__((address_space(1))) uint8_t*)src, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     else if(sizeof(U) == 2)
