@@ -222,12 +222,7 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
-    // Compile-time split so the non-registered launch drops the dead system-scope
-    // user-buffer path (see prims_ll.h). Rewritten by cmake/scripts/add_unroll.sh.
-    if (work->regUsed || work->netRegUsed)
-      runAGRingReg<T, RedOp>(tid, nthreads, work);
-    else
-      runAGRingNoReg<T, RedOp>(tid, nthreads, work);
+    runRing<T, RedOp, ProtoLL>(tid, nthreads, work);
   }
 };
 

@@ -1131,27 +1131,14 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_COLLNET_CHAIN, NCCL_PR
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
-    // As with LL128, split into two compile-time specializations so the common
-    // non-registered launch compiles the clean non-temporal-only user-load path
-    // (no dead system-scope cache-bypass code), while the registered launch keeps
-    // the system-scope path. Rewritten by cmake/scripts/add_unroll.sh into
-    // runRing<..., USE_ACC, COLL_UNROLL, /*Pipeline=*/0, /*UserRegMode=*/1|2>.
-    if (work->regUsed || work->netRegUsed)
-      runLLRingReg<T, RedOp>(tid, nthreads, work);
-    else
-      runLLRingNoReg<T, RedOp>(tid, nthreads, work);
+    runRing<T, RedOp, ProtoLL, RCCL_METADATA_EMPTY>(tid, nthreads, work);
   }
 };
 
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_TREE, NCCL_PROTO_LL> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
-    // Compile-time split so the non-registered launch drops the dead system-scope
-    // user-buffer path (see prims_ll.h). Rewritten by cmake/scripts/add_unroll.sh.
-    if (work->regUsed || work->netRegUsed)
-      runTreeSplitLLReg<T, RedOp>(tid, nthreads, work);
-    else
-      runTreeSplitLLNoReg<T, RedOp>(tid, nthreads, work);
+    runTreeSplit<T, RedOp, ProtoLL>(tid, nthreads, work);
   }
 };
 

@@ -54,28 +54,7 @@ if [[ "$HIP_FILE" =~ .*/src/device/.*\.h ]]; then
   # expanded) runRing/runTree header, right after the Pipeline / isNetOffload tail.
   perl -pi -e 's/(template<typename T, typename RedOp, typename Proto[^>]*int Pipeline[^>]*)>/\1, int UserRegMode = 0>/g' "$HIP_FILE"
 
-  # Expand the registered / non-registered dispatch helpers into the corresponding
-  # runRing instantiation (Pipeline is always 0 for LL). The template argument
-  # list must match each collective's (transformer-expanded) runRing header:
-  #   all_reduce : <T, RedOp, Proto, RCCLMetadata, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>
-  #   all_gather : <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, isNetOffload, UserRegMode>
-  #   broadcast  : <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode>
-  # NB: LL128 keeps the single UserRegMode=0 runtime path (no reg/noreg split);
-  # splitting it isolates a registered specialization the compiler spills to AGPR,
-  # which dominates the shared kernel's register reservation and hurts occupancy.
-  perl -pi -e 's/runLLRingReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, RCCL_METADATA_EMPTY, USE_ACC, COLL_UNROLL, 0, 1>(/g' "$HIP_FILE"
-  perl -pi -e 's/runLLRingNoReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, RCCL_METADATA_EMPTY, USE_ACC, COLL_UNROLL, 0, 2>(/g' "$HIP_FILE"
-  perl -pi -e 's/runAGRingReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, false, 1>(/g' "$HIP_FILE"
-  perl -pi -e 's/runAGRingNoReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, false, 2>(/g' "$HIP_FILE"
-  perl -pi -e 's/runBcastRingReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 1>(/g' "$HIP_FILE"
-  perl -pi -e 's/runBcastRingNoReg<T, RedOp>\(/runRing<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 2>(/g' "$HIP_FILE"
-
-  # AllReduce tree (LL) split: runTreeSplit header expands to
-  #   <T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, UserRegMode> (Pipeline=0 for LL).
-  perl -pi -e 's/runTreeSplitLLReg<T, RedOp>\(/runTreeSplit<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 1>(/g' "$HIP_FILE"
-  perl -pi -e 's/runTreeSplitLLNoReg<T, RedOp>\(/runTreeSplit<T, RedOp, ProtoLL, USE_ACC, COLL_UNROLL, 0, 2>(/g' "$HIP_FILE"
-
-  # LL128 reg/noreg split: unlike LL (which selects at runtime inside one kernel),
+  # LL128 reg/noreg split: LL (ProtoLL) keeps the baseline single runtime path and
   # LL128 is generated as two separate kernels (see generate.py). The RunWorkColl
   # specialization is instantiated per UserRegMode, so these dispatch helpers just
   # forward the compile-time UserRegMode template parameter into runRing/runTreeSplit.
