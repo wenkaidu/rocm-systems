@@ -63,23 +63,46 @@ srun --pty -N 2 -C "block3|block4" --ntasks-per-node=64 --gres=gpu:8 \
   -p amd-rccl -t 4:00:00 --qos=urgent bash
 ```
 
-**Or queue a batch job** (no allocation in your shell):
+**Or queue a batch job** (no allocation in your shell). Run from the **rccl repo
+root**; the submit script path is:
+
+`./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh`
+
+**bash / sh** (inline env vars):
 
 ```bash
 # Quick all_reduce on 2 nodes (default)
 ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
 
+# PAT all_gather, 16 nodes (1 rank per node, -g 1)
+env RUN_SCRIPT=run_rccl_tests_pat_all_gather_1gpu_per_node.sh SLURM_NNODES=16 \
+  ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
+
 # PAT all_gather, 8 nodes, wait for completion
-SLURM_NNODES=8 \
-  RUN_SCRIPT=run_rccl_tests_pat_all_gather_1gpu_per_node.sh \
+env RUN_SCRIPT=run_rccl_tests_pat_all_gather_1gpu_per_node.sh SLURM_NNODES=8 \
   PAT_ALLGATHER_ARGS="-b 2M -e 128M -f 2 -g 1 -d bfloat16 -w 2 -n 5 -c 0" \
-  NCCL_PAT_ENABLE=1 NCCL_ALGO=PAT \
-  WAIT=1 \
+  NCCL_PAT_ENABLE=1 NCCL_ALGO=PAT WAIT=1 \
   ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
 
 # Multi-node stress sweep on 4 nodes
-SLURM_NNODES=4 RUN_SCRIPT=run_rccl_tests_stress_multi_node.sh \
+env RUN_SCRIPT=run_rccl_tests_stress_multi_node.sh SLURM_NNODES=4 \
   ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
+```
+
+**tcsh / csh** (default login shell on some clusters — do **not** use
+`VAR=value command`; that syntax is bash-only):
+
+```tcsh
+setenv RUN_SCRIPT run_rccl_tests_pat_all_gather_1gpu_per_node.sh
+setenv SLURM_NNODES 16
+./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh
+```
+
+Or from tcsh, call through bash:
+
+```tcsh
+bash -c 'env RUN_SCRIPT=run_rccl_tests_pat_all_gather_1gpu_per_node.sh SLURM_NNODES=16 \
+  ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_rccl_tests_slurm.sh'
 ```
 
 `submit_rccl_tests_slurm.sh` writes sbatch logs under `~/rccl_slurm_jobs/` by
