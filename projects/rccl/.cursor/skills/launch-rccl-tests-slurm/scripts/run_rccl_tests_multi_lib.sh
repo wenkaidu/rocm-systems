@@ -28,6 +28,10 @@
 #                   RING (LL/LL128/SIMPLE) path (exported as-is when set)
 #   OUT_DIR         results dir (default ~/rccl_mn_perf/multi_lib)
 #   SRUN_TIMEOUT    per-run wall cap in seconds (default 400)
+#   EXTRA_ENV       space list of VAR=VAL exported to every run and logged, e.g.
+#                   "RCCL_GFX9_CHEAP_FENCE_OFF=0 NCCL_PROTO=LL128" (for A/B knobs)
+#   SRUN_EXTRA      extra srun flags, e.g. "--jobid=<id> --overlap" to run inside
+#                   an existing interactive allocation alongside its shell step
 #   RCCL_TESTS_BIN_DIR, MPI_LIB, GPUS_PER_NODE, NP, HOSTS, LAUNCHER  as usual
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,6 +93,10 @@ trap 'touch "${DONE}"' EXIT TERM
 export NCCL_IGNORE_CPU_AFFINITY="${NCCL_IGNORE_CPU_AFFINITY:-1}"
 export HSA_NO_SCRATCH_RECLAIM="${HSA_NO_SCRATCH_RECLAIM:-1}"
 [[ -n "${RCCL_DIRECT_ALLGATHER_DISABLE:-}" ]] && export RCCL_DIRECT_ALLGATHER_DISABLE
+[[ -n "${RCCL_DIRECT_REDUCE_SCATTER_DISABLE:-}" ]] && export RCCL_DIRECT_REDUCE_SCATTER_DISABLE
+# Arbitrary extra env (VAR=VAL ...) exported to every run so A/B tuning knobs
+# (e.g. RCCL_GFX9_CHEAP_FENCE_OFF=0) reach the srun tasks and are captured below.
+for _kv in ${EXTRA_ENV:-}; do [[ "${_kv}" == *=* ]] && export "${_kv?}"; done
 
 # Pre-create per-lib symlink dirs so -A's dlopen("librccl.so") resolves to the
 # tested lib (needed because we select libs via LD_LIBRARY_PATH, not LD_PRELOAD).
@@ -108,15 +116,18 @@ echo "commit,collective,cycle,order,size_bytes,oop_us,ip_us,algo,proto,nchannels
   echo "# libs: ${LIBS[*]}"
   echo "# collectives: ${_colls[*]}"
   echo "# cycles=${CYCLES} sweep -b ${MIN_BYTES} -e ${MAX_BYTES} -f ${STEP_FACTOR} -w ${WARMUP} -n ${ITERS} ${AFLAG[*]}"
-  echo "# direct_allgather_disable=${RCCL_DIRECT_ALLGATHER_DISABLE:-<unset>}"
+  echo "# direct_allgather_disable=${RCCL_DIRECT_ALLGATHER_DISABLE:-<unset>} direct_reduce_scatter_disable=${RCCL_DIRECT_REDUCE_SCATTER_DISABLE:-<unset>}"
+  echo "# extra_env=${EXTRA_ENV:-<none>}"
 } | tee "${OUT_DIR}/run.log"
 
 run_one() {  # $1=bin $2=logfile
   local bin="$1" log="$2"
   if [[ "${LAUNCHER}" == "srun" ]]; then
+    # SRUN_EXTRA lets callers add flags such as "--jobid=<id> --overlap" to run
+    # steps inside an existing (e.g. interactive) allocation alongside a shell.
     timeout --signal=TERM --kill-after=20 "${SRUN_TIMEOUT}" \
       "${SRUN_BIN}" --mpi="${SRUN_MPI}" --kill-on-bad-exit=1 --ntasks="${NP}" \
-      --ntasks-per-node="${PPN}" --cpu-bind=none \
+      --ntasks-per-node="${PPN}" --cpu-bind=none ${SRUN_EXTRA:-} \
       "${bin}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${STEP_FACTOR}" \
       -g 1 -w "${WARMUP}" -n "${ITERS}" -c 1 "${AFLAG[@]}" > "${log}" 2>&1
   else
