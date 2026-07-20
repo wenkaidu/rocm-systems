@@ -43,6 +43,9 @@ Export normal `NCCL_*` / `RCCL_*` tuning yourself before launching.
 | [scripts/run_rccl_tests_multi_lib.sh](scripts/run_rccl_tests_multi_lib.sh) | **Compare multiple RCCL libs in ONE allocation**, interleaved across cycles (`outer=cycle, mid=collective, inner=lib`) to share thermal / run-order bias. Captures per-size `algo/proto/#channels` via **`-A 1`**; writes `results.csv`. Env: **`RCCL_LIBS`** (paths or commit suffixes; first = baseline), **`COLLECTIVES`** (or `all`), **`CYCLES`**, **`RCCL_DIRECT_ALLGATHER_DISABLE`**, **`RCCL_DIRECT_REDUCE_SCATTER_DISABLE`**, **`EXTRA_ENV`** (`VAR=VAL ...` A/B knobs, e.g. `RCCL_GFX9_CHEAP_FENCE_OFF=0`), **`SRUN_EXTRA`**, sweep knobs. |
 | [scripts/report_multi_lib.py](scripts/report_multi_lib.py) | Reduce a multi-lib `results.csv` to per-size **median oop** tables + a per-collective / per-protocol **geomean delta% vs a reference lib** (isolates LL / LL128 / SIMPLE effects). Args: `[results.csv] [--ref COMMIT] [--labels c=name,...]`. |
 | [scripts/report_multi_lib_ab.py](scripts/report_multi_lib_ab.py) | **A/B two multi-lib sweeps** (two `results.csv` from differing `EXTRA_ENV`) to isolate one knob per lib. `--mode delta` prints `(B-A)/A%` per lib (neg => B faster); `--mode combined` prints each lib's delta% vs a `--ref` for both runs side by side. Args: `A B [--libs ..] [--mode delta\|combined] [--ref COMMIT]` (A/B may be a dir or its `results.csv`). |
+| [scripts/run_static_vs_dyn.sh](scripts/run_static_vs_dyn.sh) | **Compare a statically-linked rccl-tests (rccl baked into the binary from a `librccl*.a`) against the SAME source linked dynamically** across several `librccl.so` builds, interleaved per cycle. Env: **`STATIC_BIN_DIR`** (empty to skip static), **`STATIC_TAG`**, **`STATIC_ALGO_PROXY`** (same-era `.so` for the static binary's `-M` algo query), **`DYN_BIN_DIR`**, **`DYN_LIBS`** (abs paths or `RCCL_LIB_DIR` suffixes), **`COLLECTIVES`**, **`CYCLES`**, **`DTYPE`**, sweep knobs. Writes `results.csv` with per-size `algo/proto/#channels`. |
+| [scripts/report_static_vs_dyn.py](scripts/report_static_vs_dyn.py) | Summarize a `run_static_vs_dyn.sh` `results.csv`: per-collective median-oop tables with **delta% vs baseline** (default `static`), a geomean line, and an algo/proto:#channels table to confirm all configs took the same path. Args: `[results.csv] [baseline_tag]`. |
+| [scripts/submit_static_vs_dyn.sbatch](scripts/submit_static_vs_dyn.sbatch) | **`sbatch`** wrapper for `run_static_vs_dyn.sh`; `OUT_DIR` gets a `_<N>n` suffix. Submit per node count: `sbatch -N <n> --export=ALL,DYN_LIBS=..,OUT_DIR_BASE=.. submit_static_vs_dyn.sbatch`. |
 | [scripts/common_rccl_tests_slurm.sh](scripts/common_rccl_tests_slurm.sh) | Shared bash helpers (sourced by the runners). |
 | [scripts/submit_rccl_tests_slurm.sh](scripts/submit_rccl_tests_slurm.sh) | **`sbatch`** wrapper: queue any runner on `amd-rccl` (defaults match `srun --pty -N 2 -C block3\|block4 --ntasks-per-node=64 --gres=gpu:8 -p amd-rccl -t 4:00:00 --qos=urgent`). |
 
@@ -214,6 +217,97 @@ Notes:
   `hypercube`) report `N/A` for algo/proto but latency is still captured.
 - Each `srun` is wrapped in `timeout ${SRUN_TIMEOUT}` (default 400s) so one
   hanging collective cannot stall the whole interleaved sweep.
+
+## Static vs dynamic linkage (baked-in `librccl.a` vs `librccl.so`)
+
+To check whether **static linking** changes performance, or to use a
+statically-linked `dev` archive as a stable baseline for several `librccl.so`
+builds, compare a rccl-tests binary with rccl **baked in** against the **same
+source** linked dynamically. Keeping one source tree + one header set means any
+gap is pure kernel/linkage, not harness differences.
+
+### Build the two binary trees
+
+Teach `rccl-tests/src/Makefile` an `RCCL_STATIC_LIB` knob so an archive can be
+linked in place of `-lrccl`:
+
+```make
+ifneq ($(RCCL_STATIC_LIB),)
+# --start-group/--end-group (not --whole-archive): the dev archive bundles aux
+# objects with their own main() (client.cc), which --whole-archive would force in.
+HIPLDFLAGS += -Wl,--start-group $(RCCL_STATIC_LIB) -Wl,--end-group
+# rccl-tests ships its own copies of a few rccl helpers (e.g. IsArchMatch);
+# let the test's definition win, as it shadows the .so in the dynamic build.
+HIPLDFLAGS += -Wl,--allow-multiple-definition
+# A static rccl needs these named explicitly (the .so normally pulls them in):
+HIPLDFLAGS += -lrocm_smi64 -lnuma -ldrm -ldrm_amdgpu -L/opt/amdgpu/lib/x86_64-linux-gnu
+else
+LIBRARIES += rccl dl
+endif
+HIPLDFLAGS += $(LIBRARIES:%=-l%)
+# Also add -Wl,--export-dynamic so the static binary exposes its baked-in rccl*
+# symbols to the -M dlopen(NULL) algo query.
+```
+
+Build the **static** tree (rccl from the archive) and a **dynamic** counterpart
+from the identical source + headers. Use develop headers that match the archive
+ABI (`NCCL_HOME=.../build_rel/include`), **not** a stale `/opt/rocm` header:
+
+```bash
+cd ~/rccl-tests-static
+ALLCOLL="all_reduce all_gather reduce_scatter"   # BIN_FILES_LIST subset
+# static: rccl baked in
+make -j"$(nproc)" MPI=1 MPI_HOME=$HOME/mpich/install \
+  NCCL_HOME=$HOME/rccl_build_wt/<devwt>/build_rel/include \
+  RCCL_STATIC_LIB=$HOME/rccl_libs/librccl-dev.a \
+  GPU_TARGETS=gfx942 BIN_FILES_LIST="$ALLCOLL"
+# dynamic counterpart: same source, -lrccl chosen at runtime
+make -j"$(nproc)" BUILDDIR=build_dyn MPI=1 MPI_HOME=$HOME/mpich/install \
+  NCCL_HOME=$HOME/rccl_build_wt/<devwt>/build_rel/include \
+  CUSTOM_RCCL_LIB=$HOME/rccl_build_wt/<devwt>/build_rel \
+  GPU_TARGETS=gfx942 BIN_FILES_LIST="$ALLCOLL"
+# confirm the static binary has no librccl.so dependency:
+ldd build/all_reduce_perf | grep -i rccl || echo "statically linked"
+```
+
+### Run and report
+
+Interleave the static config plus any number of dynamic libs in one allocation.
+`STATIC_ALGO_PROXY` is a same-era develop `.so` used **only** for the static
+binary's `-M` algo/proto query (its collective still runs the baked-in rccl):
+
+```bash
+DYN_LIBS="0ff9140 pr8451f2af4e8 92be5e5new" \
+STATIC_TAG=static_dev0717 \
+STATIC_ALGO_PROXY=$HOME/rccl_build_wt/2976ade3/build_rel/librccl.so.1.0 \
+COLLECTIVES="all_reduce_perf all_gather_perf reduce_scatter_perf" \
+CYCLES=5 DTYPE=bfloat16 OUT_DIR=~/rccl_mn_perf/static_vs_dyn_1n \
+  ./.cursor/skills/launch-rccl-tests-slurm/scripts/run_static_vs_dyn.sh
+
+./.cursor/skills/launch-rccl-tests-slurm/scripts/report_static_vs_dyn.py \
+  ~/rccl_mn_perf/static_vs_dyn_1n/results.csv static_dev0717
+```
+
+Queue per node count via the sbatch wrapper (report each as it lands, since
+larger allocations take longer to schedule):
+
+```bash
+for n in 1 2 4; do
+  sbatch -N $n --export=ALL,DYN_LIBS="0ff9140 pr8451f2af4e8 92be5e5new",\
+STATIC_TAG=static_dev0717,\
+STATIC_ALGO_PROXY=$HOME/rccl_build_wt/2976ade3/build_rel/librccl.so.1.0,\
+COLLECTIVES="all_reduce_perf all_gather_perf reduce_scatter_perf",\
+OUT_DIR_BASE=$HOME/rccl_mn_perf/static_vs_dyn,CYCLES=5 \
+    ./.cursor/skills/launch-rccl-tests-slurm/scripts/submit_static_vs_dyn.sbatch
+done
+```
+
+Read the report by protocol band (the algo/proto table confirms every config
+picked the same path, so deltas are kernel/linkage only): typically there is
+**no systematic static-vs-dynamic penalty** — gaps track the underlying lib
+differences (e.g. an LL128 mid-range win, or a small-message LL regression).
+Single-cycle blow-ups at small all_gather sizes are fabric noise; add cycles to
+average them out.
 
 ### Launcher selection
 
