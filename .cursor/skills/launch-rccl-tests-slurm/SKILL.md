@@ -107,6 +107,43 @@ All are optional; defaults live at the top of each script.
 - `DTYPE / MIN_BYTES / MAX_BYTES / STEP_FACTOR / WARMUP / ITERS` — rccl-tests `-d/-b/-e/-f/-w/-n`.
 - `RCCL_TESTS_BIN_DIR`, `RCCL_BUILD_DIR`, `MPIRUN_BIN` — override binary/library paths.
 
+## Ruby cluster (bnxt_re NICs)
+
+The `ruby` cluster (login node `ruby-slurmlogin01`, partitions `meta64` /
+`interactive`, nodes `cv350-rck-*`) uses **Broadcom `bnxt_re` RoCE NICs**, not
+the Mellanox `mlx5` HCAs the `run_csum_*.sh` defaults assume. Multi-node runs
+will silently hang during connection setup unless you override the fabric env.
+Each node has 8 GPUs; a 2-node run is `-N 2 --ntasks-per-node=8` (16 ranks).
+
+Required per-rank env on ruby (pass via `srun`'s inherited env, or `-x`/`-env`
+with mpirun):
+
+```bash
+export NCCL_IGNORE_CPU_AFFINITY=1
+export NCCL_IB_HCA=bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re6,bnxt_re7
+export NCCL_SOCKET_IFNAME=fenic0,enp49s0f0np0
+export NCCL_IB_GID_INDEX=3
+export NCCL_IB_TC=104
+export NCCL_GRAPH_REGISTER=0
+export NCCL_NET_SHARED_BUFFERS=0
+```
+
+With `run_csum_stress.sh`, override the defaults inline, e.g.:
+
+```bash
+NCCL_IB_HCA=bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re6,bnxt_re7 \
+NCCL_IB_TC=104 \
+tools/run_csum_stress.sh
+```
+
+(`NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, `NCCL_GRAPH_REGISTER`,
+`NCCL_NET_SHARED_BUFFERS` are ruby-specific and are not in the script's env
+list — export them in the shell before launching so they propagate through
+`srun --export=ALL`.)
+
+Verified working with a 2-node `reduce_scatter_perf -d bfloat16 -b 8 -e 1G -f 2`
+(16 ranks, srun `--mpi=pmi2`): 0 `#wrong`, ~335 GB/s busbw at 1 GB.
+
 ## Why srun (not mpirun) inside an allocation
 
 mpich `mpirun` launches remote ranks over ssh, which stalls from a non-TTY
