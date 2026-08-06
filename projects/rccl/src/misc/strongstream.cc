@@ -109,13 +109,25 @@ ncclResult_t ncclCudaGraphAddDestructor(struct ncclCudaGraph graph, cudaHostFn_t
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// Opt-in (default off): when set to 1, the strong stream's liveStream and its
+// scarce GPU hardware queue are allocated lazily and reclaimed while idle so the
+// queue stays free during steady-state collectives. When 0 (default) the stream
+// is created eagerly at construct and held for the comm lifetime, matching the
+// original upstream behavior.
+RCCL_PARAM(LazyStrongStream, "LAZY_STRONG_STREAM", 0);
+bool ncclLazyStrongStreamEnabled() { return rcclParamLazyStrongStream() == 1; }
+
 ncclResult_t ncclStrongStreamConstruct(struct ncclStrongStream* ss) {
-  // liveStream (and its scarce GPU hardware queue) is created lazily on first
-  // real use via ncclStrongStreamEnsureLive(), and can be reclaimed while idle
-  // via ncclStrongStreamRelinquish(). This keeps the HW queue free during the
-  // steady-state collective phase for the normal (non-captured, single-stream)
-  // path, which never submits work to it.
+  // When the optimization is enabled, liveStream (and its scarce GPU hardware
+  // queue) is created lazily on first real use via ncclStrongStreamEnsureLive(),
+  // and can be reclaimed while idle via ncclStrongStreamRelinquish(). This keeps
+  // the HW queue free during the steady-state collective phase for the normal
+  // (non-captured, single-stream) path, which never submits work to it.
+  // When disabled (default) it is created eagerly here (original behavior).
   ss->liveStream = nullptr;
+  if (!ncclLazyStrongStreamEnabled()) {
+    CUDACHECK(cudaStreamCreateWithFlags(&ss->liveStream, cudaStreamNonBlocking));
+  }
   #if ROCM_VERSION >= 60100
     ss->everCaptured = false;
     ss->captureHead = nullptr;
@@ -136,6 +148,8 @@ ncclResult_t ncclStrongStreamEnsureLive(struct ncclStrongStream* ss) {
 // Destroy the underlying non-captured stream to free its HW queue while idle.
 // No-op if not yet created or if a graph capture is currently in flight.
 ncclResult_t ncclStrongStreamRelinquish(struct ncclStrongStream* ss) {
+  // Opt-out: keep the eagerly-created stream alive (original behavior).
+  if (!ncclLazyStrongStreamEnabled()) return ncclSuccess;
   #if ROCM_VERSION >= 60100
     if (ss->captureHead != nullptr) return ncclSuccess;
   #endif

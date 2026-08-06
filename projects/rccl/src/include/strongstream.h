@@ -79,6 +79,12 @@ ncclResult_t ncclCudaGraphAddDestructor(struct ncclCudaGraph graph, cudaHostFn_t
  */
 struct ncclStrongStream;
 
+// Whether the lazy strong-stream HW-queue optimization is enabled. It is opt-in
+// (off by default) via RCCL_LAZY_STRONG_STREAM=1. When disabled the strong
+// stream's liveStream is created eagerly at construct and held for the comm
+// lifetime (original upstream behavior).
+bool ncclLazyStrongStreamEnabled();
+
 ncclResult_t ncclStrongStreamConstruct(struct ncclStrongStream* ss);
 ncclResult_t ncclStrongStreamDestruct(struct ncclStrongStream* ss);
 

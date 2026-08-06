@@ -1766,8 +1766,10 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
     // deviceStream (its persistent liveStream + scarce HW queue) is only needed
     // when we must serialize against user streams, graph capture, implicit launch
     // order, or graph-mixing. The normal single-stream, non-captured path never
-    // submits to it, so skip acquiring it and leave its HW queue free.
-    bool needDeviceStream = persistent || planner->numStreams != 1
+    // submits to it, so skip acquiring it and leave its HW queue free. When the
+    // optimization is disabled it is always acquired (original behavior).
+    bool needDeviceStream = !ncclLazyStrongStreamEnabled()
+                          || persistent || planner->numStreams != 1
                           || implicitOrder != ncclImplicitOrderNone
                           || comm->sharedRes->deviceStream.everCaptured;
     if (needDeviceStream) {
@@ -2057,7 +2059,8 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
     }
     // Release deviceStream if it was acquired in ncclLaunchPrepare(). Must match
     // the needDeviceStream predicate used there so acquire/release stay balanced.
-    bool needDeviceStream = capturing || planner->numStreams != 1
+    bool needDeviceStream = !ncclLazyStrongStreamEnabled()
+                          || capturing || planner->numStreams != 1
                           || implicitOrder != ncclImplicitOrderNone
                           || comm->sharedRes->deviceStream.everCaptured;
     if (needDeviceStream) {
