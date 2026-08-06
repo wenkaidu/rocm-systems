@@ -324,12 +324,14 @@ void rcclUpdateThreadThreshold(struct ncclComm* comm, size_t const& nBytes, stru
 
 void rcclSetPipelining(struct ncclComm* comm, size_t const& nBytes, struct ncclTaskColl* info) {
   info->pipeline = 0; // Default to no pipelining
-  if (rcclParamdisableReduceCopyPipelining() || IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) {
+  if (rcclParamdisableReduceCopyPipelining()) {
     return;
   }
   const bool dtypeOK = (info->datatype == ncclBfloat16) || rcclParamPipelineAllDTypes();
+  const bool isGfx942 = IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942");
+  const bool isGfx950 = IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950");
 
-  if (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") && dtypeOK) {
+  if ((isGfx942 || isGfx950) && dtypeOK) {
     switch (info->func) {
     // For multi-node case, we check if the number of bytes (`nBytes`) satisfies
     // the Bf16 Limit Equation for bf16 all_reduce on MI300:
@@ -342,6 +344,11 @@ void rcclSetPipelining(struct ncclComm* comm, size_t const& nBytes, struct ncclT
       }
       break;
 
+    // ReduceScatter/Reduce pipelining now also enabled for gfx950 (experiment): the
+    // double-buffered reduceCopyPacksPipelined path overlaps next-hunk loads with the
+    // current-hunk reduce+store to hide load-to-use latency at 256 threads/block, instead
+    // of relying on a 2nd wave per SIMD. Requires bf16 (pipelined_types) or
+    // RCCL_PIPELINE_ALL_DATA_TYPES=1.
     case ncclFuncReduceScatter:
     case ncclFuncReduce:
       info->pipeline = 1;
