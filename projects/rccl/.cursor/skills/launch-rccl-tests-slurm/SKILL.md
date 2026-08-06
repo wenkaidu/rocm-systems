@@ -38,6 +38,8 @@ Export normal `NCCL_*` / `RCCL_*` tuning yourself before launching.
 | [scripts/run_rccl_tests_stress_multi_node.sh](scripts/run_rccl_tests_stress_multi_node.sh) | Full sweep of `*_perf` on all allocation nodes; logs + `SUMMARY.txt`. |
 | [scripts/run_rccl_tests_stress_single_node.sh](scripts/run_rccl_tests_stress_single_node.sh) | Same sweep on **one** node (`srun -N1` in an alloc, or local `mpirun`). |
 | [scripts/run_rccl_tests_stress_soak.sh](scripts/run_rccl_tests_stress_soak.sh) | Run the multi-node stress script `CYCLES` times; writes `AGGREGATE.txt`. |
+| [scripts/run_ll128_coherence_soak.sh](scripts/run_ll128_coherence_soak.sh) | **Coherence soak**: force `NCCL_PROTO=LL128` and hammer a collective (default `all_reduce`) at **small sizes**, **high rank counts**, **many iterations**, over **exact-integer datatypes** (`int8..uint64`, `sum` → bit-exact so any `#wrong>0` is a real coherence bug), sweeping **both `-R 0` non-registered and `-R 1` registered** user buffers (the two LL128 kernel paths PR #9347 splits). Auto-creates a `librccl.so.1` link dir for `RCCL_LIB`; pins OOB bootstrap to `OOB_IFACE` (default `eth0`); **marker-kills** each run at its completion line so post-result teardown hangs don't stall/false-fail. Content-based pass/fail (`total_wrong`), not exit code. Env: `RCCL_LIB`, `DTYPES`, `REGS`, `OP`, `MIN_BYTES`/`MAX_BYTES`, `ITERS`, `CHECK` (`-c`), `RUN_CYCLES` (`-N`), `CYCLES`, `SRUN_TIMEOUT`. |
+| [scripts/submit_ll128_coherence_soak.sbatch](scripts/submit_ll128_coherence_soak.sbatch) | **`sbatch`** wrapper for the coherence soak; sets site RoCE tuning + `OUT_DIR`. Submit per scale: `sbatch -N 16 --exclude=<bad nodes> --export=ALL,RCCL_LIB=... submit_ll128_coherence_soak.sbatch`. |
 | [scripts/run_rccl_tests_alltoallv_p2p_channels_random.sh](scripts/run_rccl_tests_alltoallv_p2p_channels_random.sh) | **`alltoallv_perf`**: `COMBOS` trials (default 100) with random `NP` in `1..allocation` and random `NCCL_MAX_P2P_NCHANNELS` ∈ {1,2,4,8,16,32,64}; `NCCL_MIN_P2P_NCHANNELS=1`. |
 | [scripts/run_rccl_tests_pat_all_gather_1gpu_per_node.sh](scripts/run_rccl_tests_pat_all_gather_1gpu_per_node.sh) | **`all_gather_perf`**: **every allocated node**, one MPI rank per node (**`GPUS_PER_NODE=1`**, ignores preset **`NP`**), **`srun --nodes=$NNODES`**, **`-g 1`**; defaults **`NCCL_DEBUG=INFO`**, **`NCCL_DEBUG_SUBSYS=INIT,TUNING`** (algorithm lines), **`NCCL_PAT_ENABLE=1`**, **2 MiB** sweep (`-b 2M -e 2M`); override via **`PAT_ALLGATHER_ARGS`** / **`NCCL_PAT_ENABLE`**. |
 | [scripts/run_rccl_tests_multi_lib.sh](scripts/run_rccl_tests_multi_lib.sh) | **Compare multiple RCCL libs in ONE allocation**, interleaved across cycles (`outer=cycle, mid=collective, inner=lib`) to share thermal / run-order bias. Captures per-size `algo/proto/#channels` via **`-A 1`**; writes `results.csv`. Env: **`RCCL_LIBS`** (paths or commit suffixes; first = baseline), **`COLLECTIVES`** (or `all`), **`CYCLES`**, **`RCCL_DIRECT_ALLGATHER_DISABLE`**, **`RCCL_DIRECT_REDUCE_SCATTER_DISABLE`**, **`EXTRA_ENV`** (`VAR=VAL ...` A/B knobs, e.g. `RCCL_GFX9_CHEAP_FENCE_OFF=0`), **`SRUN_EXTRA`**, sweep knobs. |
@@ -308,6 +310,66 @@ picked the same path, so deltas are kernel/linkage only): typically there is
 differences (e.g. an LL128 mid-range win, or a small-message LL regression).
 Single-cycle blow-ups at small all_gather sizes are fabric noise; add cycles to
 average them out.
+
+## LL128 coherence soak (forced protocol, exact-integer validation)
+
+To stress a **specific protocol's correctness at scale** — e.g. validating the
+`ll128-reg-split` work (PR #9347) that emits separate **registered vs
+non-registered** user-buffer LL128 kernels — force the protocol and check
+results with datatypes whose reduction is **bit-exact**, so any mismatch is a
+genuine coherence bug rather than float rounding.
+
+```bash
+# Inside a healthy N-node allocation (SLURM_JOB_ID set), or via the sbatch wrapper.
+RCCL_LIB=$HOME/rccl_libs/librccl.so.1.0.pr9347 \
+DTYPES="int8 uint8 int32 uint32 int64 uint64" REGS="0 1" \
+MIN_BYTES=8 MAX_BYTES=64K ITERS=30 CHECK=5 CYCLES=4 SRUN_TIMEOUT=180 \
+OUT_DIR=$HOME/rccl_ll128_soak_16n \
+  ./.cursor/skills/launch-rccl-tests-slurm/scripts/run_ll128_coherence_soak.sh
+```
+
+The runner forces `NCCL_PROTO=LL128`, runs `-o sum -c ${CHECK}` per size, and
+reports `PASS (0 wrong)` only if **every** run validated with `total_wrong=0`.
+`SUMMARY.txt` legend: `OK` clean exit · `OK*` validated 0-wrong but killed on a
+teardown hang · `WRONG` coherence mismatch · `HANG` no sweep completed. Aggregate
+across raw logs to double-check:
+
+```bash
+awk '/^[[:space:]]*[0-9]+[[:space:]]/{r++; if(NF>=13)w+=$9+$13} END{printf "rows=%d wrong=%d\n",r,w+0}' "$OUT_DIR"/c*.log
+grep -rh 'Out of bounds values' "$OUT_DIR"/c*.log | grep -vc ': 0 OK'   # want 0
+```
+
+Confirm the protocol was actually honored (not just requested) with a short
+`NCCL_DEBUG_SUBSYS=ENV` run: look for `NCCL_PROTO set by environment to LL128`.
+
+### Multi-node bring-up gotchas (learned the hard way)
+
+These bit us going from 4 → 16 nodes; check them **before** blaming the lib:
+
+- **SONAME resolution.** rccl-tests links against `librccl.so.1`. A directory
+  that only contains `librccl.so.1.0.<tag>` files does **not** satisfy the
+  loader — it silently falls back to `/opt/rocm/lib/librccl.so.1` (you test the
+  wrong lib). Always expose a `librccl.so.1` symlink dir on `LD_LIBRARY_PATH`
+  (`run_ll128_coherence_soak.sh` and `run_rccl_tests_multi_lib.sh` do this
+  automatically). Verify with `ldd .../all_reduce_perf | grep rccl`.
+- **Out-of-band bootstrap must use the routable management NIC**, not the RoCE
+  `rdma*` devices. At 16 nodes MPICH/UCX `MPI_Init` (and RCCL's own socket
+  bootstrap) can fail with `UCX ... Destination is unreachable` / DC
+  `ibv_create_ah ... Connection timed out` unless you pin them to `eth0`:
+  `NCCL_SOCKET_IFNAME=eth0 UCX_NET_DEVICES=eth0 UCX_TLS=tcp,sm,self`
+  (the runner sets these from `OOB_IFACE`). Small allocations often "work"
+  on defaults and mask this.
+- **Dead RoCE links = specific bad nodes.** `ibv_modify_qp failed with 110
+  Connection timed out ... INIT -> RTR ... dev mlx5_X` during RCCL init means a
+  node pair can't establish QPs (data path), independent of your config. It
+  reproduces on the same hosts. Bisect (2 → 8 → 16 nodes) to find them, then
+  `--exclude=<nodelist>` and re-request until you get a healthy island. A clean
+  16-node run prints the data table with `# Out of bounds values : 0 OK`.
+- **Benign teardown hangs.** Some stacks finish the test (print `Avg bus
+  bandwidth`) then hang in `ncclCommDestroy`/`MPI_Finalize`. Don't treat the
+  resulting non-zero exit as a failure — key on log content. The soak runner
+  launches `srun` in the background and stops it at the completion marker, so a
+  60 s test doesn't eat a 180 s timeout on every run.
 
 ### Launcher selection
 
