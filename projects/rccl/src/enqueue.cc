@@ -1756,8 +1756,23 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
     if (nPlans == 0) return ncclSuccess;
 
     cudaStream_t launchStream = planner->streams->stream;
-    cudaStream_t deviceStream, launchOrder;
-    NCCLCHECKGOTO(ncclStrongStreamAcquire(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream), result, failure);
+    cudaStream_t deviceStream = nullptr, launchOrder;
+
+    bool capturing = ncclCudaGraphValid(planner->capturingGraph);
+    enum ncclImplicitOrder implicitOrder;
+    cudaError_t status = cudaSuccess;
+    NCCLCHECKGOTO(getImplicitOrder(&implicitOrder, capturing), result, failure);
+
+    // deviceStream (its persistent liveStream + scarce HW queue) is only needed
+    // when we must serialize against user streams, graph capture, implicit launch
+    // order, or graph-mixing. The normal single-stream, non-captured path never
+    // submits to it, so skip acquiring it and leave its HW queue free.
+    bool needDeviceStream = persistent || planner->numStreams != 1
+                          || implicitOrder != ncclImplicitOrderNone
+                          || comm->sharedRes->deviceStream.everCaptured;
+    if (needDeviceStream) {
+      NCCLCHECKGOTO(ncclStrongStreamAcquire(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream), result, failure);
+    }
 
     if (persistent || planner->numStreams != 1) {
       // userStream[0] waits on each userStream[i]...
@@ -1771,11 +1786,6 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       // Stream changed from last call, create dependency against last NCCL kernel launch
       CUDACHECKGOTO(hipStreamWaitEvent(planner->streams->stream, comm->doneEvent, 0), result, failure);
     }
-
-    bool capturing = ncclCudaGraphValid(planner->capturingGraph);
-    enum ncclImplicitOrder implicitOrder;
-    cudaError_t status = cudaSuccess;
-    NCCLCHECKGOTO(getImplicitOrder(&implicitOrder, capturing), result, failure);
 
     if (implicitOrder != ncclImplicitOrderNone) {
       // userStream[0] waits on per-device (context) launchOrder. Concurrent strong stream access is
@@ -2045,8 +2055,14 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
       // Release launchOrder as acquired in ncclLaunchPrepare()
       NCCLCHECK(ncclStrongStreamRelease(planner->capturingGraph, &comm->context->launchOrder, concurrent));
     }
-    // Release deviceStream as acquired in ncclLaunchPrepare()
-    NCCLCHECK(ncclStrongStreamRelease(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false));
+    // Release deviceStream if it was acquired in ncclLaunchPrepare(). Must match
+    // the needDeviceStream predicate used there so acquire/release stay balanced.
+    bool needDeviceStream = capturing || planner->numStreams != 1
+                          || implicitOrder != ncclImplicitOrderNone
+                          || comm->sharedRes->deviceStream.everCaptured;
+    if (needDeviceStream) {
+      NCCLCHECK(ncclStrongStreamRelease(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false));
+    }
   }
   return ncclSuccess;
 }

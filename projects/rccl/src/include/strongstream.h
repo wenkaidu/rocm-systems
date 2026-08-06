@@ -82,6 +82,12 @@ struct ncclStrongStream;
 ncclResult_t ncclStrongStreamConstruct(struct ncclStrongStream* ss);
 ncclResult_t ncclStrongStreamDestruct(struct ncclStrongStream* ss);
 
+// Lazily create the underlying non-captured stream (and its HW queue).
+ncclResult_t ncclStrongStreamEnsureLive(struct ncclStrongStream* ss);
+// Destroy the underlying non-captured stream to free its HW queue while idle.
+// No-op if not created or if a graph capture is in flight.
+ncclResult_t ncclStrongStreamRelinquish(struct ncclStrongStream* ss);
+
 // Acquire the strong stream. Upon return `*workStream` will be usable to add work.
 // `concurrent` indicates if other threads may be using the strong stream.
 ncclResult_t ncclStrongStreamAcquire(

@@ -345,6 +345,13 @@ exit:
   NCCLCHECK(ncclStreamWaitStream(deviceStream, hostStream, comm->sharedRes->scratchEvent));
   NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(), &comm->sharedRes->hostStream, /*concurrent=*/false));
   NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(), &comm->sharedRes->deviceStream, /*concurrent=*/false));
+  // Free the strong streams' shared HW queue now that (pre)connect setup is done.
+  // Covers both init-time and lazy first-collective connect (e.g. all-to-all).
+  // They are lazily recreated on demand if a later phase needs them.
+  if (ret == ncclSuccess) {
+    NCCLCHECK(ncclStrongStreamRelinquish(&comm->sharedRes->hostStream));
+    NCCLCHECK(ncclStrongStreamRelinquish(&comm->sharedRes->deviceStream));
+  }
   return ret;
 fail:
   goto exit;

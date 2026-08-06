@@ -110,7 +110,12 @@ ncclResult_t ncclCudaGraphAddDestructor(struct ncclCudaGraph graph, cudaHostFn_t
 ////////////////////////////////////////////////////////////////////////////////
 
 ncclResult_t ncclStrongStreamConstruct(struct ncclStrongStream* ss) {
-  CUDACHECK(cudaStreamCreateWithFlags(&ss->liveStream, cudaStreamNonBlocking));
+  // liveStream (and its scarce GPU hardware queue) is created lazily on first
+  // real use via ncclStrongStreamEnsureLive(), and can be reclaimed while idle
+  // via ncclStrongStreamRelinquish(). This keeps the HW queue free during the
+  // steady-state collective phase for the normal (non-captured, single-stream)
+  // path, which never submits work to it.
+  ss->liveStream = nullptr;
   #if ROCM_VERSION >= 60100
     ss->everCaptured = false;
     ss->captureHead = nullptr;
@@ -120,8 +125,30 @@ ncclResult_t ncclStrongStreamConstruct(struct ncclStrongStream* ss) {
   return ncclSuccess;
 }
 
+// Lazily create the underlying non-captured stream (and its HW queue).
+ncclResult_t ncclStrongStreamEnsureLive(struct ncclStrongStream* ss) {
+  if (ss->liveStream == nullptr) {
+    CUDACHECK(cudaStreamCreateWithFlags(&ss->liveStream, cudaStreamNonBlocking));
+  }
+  return ncclSuccess;
+}
+
+// Destroy the underlying non-captured stream to free its HW queue while idle.
+// No-op if not yet created or if a graph capture is currently in flight.
+ncclResult_t ncclStrongStreamRelinquish(struct ncclStrongStream* ss) {
+  #if ROCM_VERSION >= 60100
+    if (ss->captureHead != nullptr) return ncclSuccess;
+  #endif
+  if (ss->liveStream != nullptr) {
+    CUDACHECK(cudaStreamSynchronize(ss->liveStream));
+    CUDACHECK(cudaStreamDestroy(ss->liveStream));
+    ss->liveStream = nullptr;
+  }
+  return ncclSuccess;
+}
+
 ncclResult_t ncclStrongStreamDestruct(struct ncclStrongStream* ss) {
-  CUDACHECK(cudaStreamDestroy(ss->liveStream));
+  if (ss->liveStream != nullptr) CUDACHECK(cudaStreamDestroy(ss->liveStream));
   #if ROCM_VERSION >= 60100
     struct ncclStrongStreamCapture* cap = ss->captureHead;
     while (cap) {
@@ -150,6 +177,7 @@ ncclResult_t ncclStrongStreamAcquire(
   #if ROCM_VERSION >= 60100
     bool mixing = ncclParamGraphMixingSupport();
     if (graph.graphId == ULLONG_MAX) {
+      NCCLCHECK(ncclStrongStreamEnsureLive(ss));
       *workStream = ss->liveStream;
       ss->liveAcquiredBy = localThreadId();
       if (mixing && __atomic_load_n(&ss->everCaptured, __ATOMIC_RELAXED)) {
@@ -241,6 +269,7 @@ ncclResult_t ncclStrongStreamAcquiredWorkStream(
   ) {
   #if ROCM_VERSION >= 60100
     if (graph.graphId == ULLONG_MAX) {
+      NCCLCHECK(ncclStrongStreamEnsureLive(ss));
       *workStream = ss->liveStream;
     } else {
       if (concurrent) pthread_mutex_lock(&ss->lock);
@@ -262,7 +291,7 @@ ncclResult_t ncclStrongStreamRelease(
     bool mixing = ncclParamGraphMixingSupport();
     if (mixing) {
       if (graph.graphId == ULLONG_MAX) {
-        if (__atomic_load_n(&ss->everCaptured, __ATOMIC_RELAXED)) {
+        if (ss->liveStream != nullptr && __atomic_load_n(&ss->everCaptured, __ATOMIC_RELAXED)) {
           CUDACHECK(cudaEventRecord(ss->serialEvent, ss->liveStream));
         }
         if (ss->liveAcquiredBy != localThreadId() && ncclParamLaunchRaceFatal()) {
@@ -384,6 +413,7 @@ ncclResult_t ncclStreamAdvanceToEvent(struct ncclCudaGraph g, cudaStream_t s, cu
 }
 
 ncclResult_t ncclStrongStreamSynchronize(struct ncclStrongStream* ss) {
+  if (ss->liveStream == nullptr) return ncclSuccess; // nothing was ever submitted
   #if ROCM_VERSION >= 60100
     CUDACHECK(cudaStreamWaitEvent(ss->liveStream, ss->serialEvent, 0));
   #endif

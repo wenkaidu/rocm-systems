@@ -2373,6 +2373,13 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     NCCLCHECKGOTO(ncclSideStreamRelease(comm->cudaDev, comm->sideStreamPriority), res, fail);
     comm->sideStreamAcquired = false;
   }
+
+  // RCCL: the deviceStream/hostStream strong streams are only exercised during
+  // setup phases; free their (shared) HW queue now. They are lazily recreated on
+  // demand if a later launch actually needs them (graph capture, multi-stream,
+  // implicit launch order) or during runtime transport setup.
+  NCCLCHECKGOTO(ncclStrongStreamRelinquish(&comm->sharedRes->deviceStream), res, fail);
+  NCCLCHECKGOTO(ncclStrongStreamRelinquish(&comm->sharedRes->hostStream), res, fail);
   timers[TIMER_INIT_TOTAL] = clockNano() - timers[TIMER_INIT_TOTAL];
 
   // Trace this call for replay tool
