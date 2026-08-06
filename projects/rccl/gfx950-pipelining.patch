@@ -1,0 +1,77 @@
+From d74ebbf7c1ae56a8da243ee095c54b341a624fbf Mon Sep 17 00:00:00 2001
+From: Wenkai Du <wenkai.du@amd.com>
+Date: Thu, 6 Aug 2026 15:46:43 +0000
+Subject: [PATCH] [RCCL] enable ReduceScatter pipelining on gfx950 (experiment)
+
+Enable the software-pipelined reduceCopyPacksPipelined path for gfx950 so a
+256-thread block can hide load-to-use latency via double-buffering instead of a
+second wave per SIMD. Intended for multi-node ReduceScatter bf16 perf evaluation.
+
+- generate.py: stop forcing gfx950 to pipeline "0" in
+  calc_unroll_and_pipeline_for_local_arch (now all_pipelines), so pipeline=1
+  kernels are emitted for the already-pipelined collectives (ReduceScatter,
+  Reduce, AllReduce).
+- rccl_wrap.cc rcclSetPipelining: drop the gfx950 early-return and gate on
+  isGfx942 || isGfx950. ReduceScatter/Reduce already set info->pipeline = 1.
+  Still gated on bf16 unless RCCL_PIPELINE_ALL_DATA_TYPES=1.
+
+Pipelined kernels are only generated for bf16 (pipelined_types) and SIMPLE
+proto; requires a full device rebuild (generate.py changed). This branch is
+based directly on the NCCL 2.30.7 sync (256 threads/block on gfx950); the
+temporary 512-thread revert (96f6d9f) is intentionally dropped.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ projects/rccl/src/device/generate.py |  2 +-
+ projects/rccl/src/rccl_wrap.cc       | 11 +++++++++--
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/projects/rccl/src/device/generate.py b/projects/rccl/src/device/generate.py
+index a74220a871..dbe6a8b411 100755
+--- a/projects/rccl/src/device/generate.py
++++ b/projects/rccl/src/device/generate.py
+@@ -246,7 +246,7 @@ def calc_unroll_and_pipeline_for_local_arch():
+   if len(gfx_targets) == 1:
+     gfx_name, cu_count = gfx_targets[0]
+     if "gfx950" == gfx_name:
+-      return (["1", "2"], ["0"])  # Disable pipelining for gfx950
++      return (["1", "2"], all_pipelines)  # Enable pipelining for gfx950 (experiment: ReduceScatter pipelining)
+     elif "gfx908" == gfx_name or ("gfx942" == gfx_name and cu_count > 80):
+       return (["2"], all_pipelines)
+     else:
+diff --git a/projects/rccl/src/rccl_wrap.cc b/projects/rccl/src/rccl_wrap.cc
+index fbde1feb81..25156066f1 100644
+--- a/projects/rccl/src/rccl_wrap.cc
++++ b/projects/rccl/src/rccl_wrap.cc
+@@ -324,12 +324,14 @@ void rcclUpdateThreadThreshold(struct ncclComm* comm, size_t const& nBytes, stru
+ 
+ void rcclSetPipelining(struct ncclComm* comm, size_t const& nBytes, struct ncclTaskColl* info) {
+   info->pipeline = 0; // Default to no pipelining
+-  if (rcclParamdisableReduceCopyPipelining() || IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) {
++  if (rcclParamdisableReduceCopyPipelining()) {
+     return;
+   }
+   const bool dtypeOK = (info->datatype == ncclBfloat16) || rcclParamPipelineAllDTypes();
++  const bool isGfx942 = IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942");
++  const bool isGfx950 = IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950");
+ 
+-  if (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") && dtypeOK) {
++  if ((isGfx942 || isGfx950) && dtypeOK) {
+     switch (info->func) {
+     // For multi-node case, we check if the number of bytes (`nBytes`) satisfies
+     // the Bf16 Limit Equation for bf16 all_reduce on MI300:
+@@ -342,6 +344,11 @@ void rcclSetPipelining(struct ncclComm* comm, size_t const& nBytes, struct ncclT
+       }
+       break;
+ 
++    // ReduceScatter/Reduce pipelining now also enabled for gfx950 (experiment): the
++    // double-buffered reduceCopyPacksPipelined path overlaps next-hunk loads with the
++    // current-hunk reduce+store to hide load-to-use latency at 256 threads/block, instead
++    // of relying on a 2nd wave per SIMD. Requires bf16 (pipelined_types) or
++    // RCCL_PIPELINE_ALL_DATA_TYPES=1.
+     case ncclFuncReduceScatter:
+     case ncclFuncReduce:
+       info->pipeline = 1;
+-- 
+2.52.0
+
