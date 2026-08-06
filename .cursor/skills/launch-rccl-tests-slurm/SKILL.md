@@ -119,13 +119,20 @@ Required per-rank env on ruby (pass via `srun`'s inherited env, or `-x`/`-env`
 with mpirun):
 
 ```bash
+# ruby bnxt_re RoCE fabric
 export NCCL_IGNORE_CPU_AFFINITY=1
 export NCCL_IB_HCA=bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re6,bnxt_re7
 export NCCL_SOCKET_IFNAME=fenic0,enp49s0f0np0
 export NCCL_IB_GID_INDEX=3
 export NCCL_IB_TC=104
-export NCCL_GRAPH_REGISTER=0
-export NCCL_NET_SHARED_BUFFERS=0
+# rccl-tests baseline env
+export HSA_NO_SCRATCH_RECLAIM=1
+export RCCL_MSCCL_ENABLE=0
+export RCCL_IB_QPS_PER_P2P=1
+export RCCL_P2P_BATCH_ENABLE=0
+export NCCL_DEBUG=VERSION
+export RSMI_MUTEX_THREAD_ONLY=1
+export NCCL_IB_QPS_PER_CONNECTION=4
 ```
 
 With `run_csum_stress.sh`, override the defaults inline, e.g.:
@@ -136,10 +143,9 @@ NCCL_IB_TC=104 \
 tools/run_csum_stress.sh
 ```
 
-(`NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, `NCCL_GRAPH_REGISTER`,
-`NCCL_NET_SHARED_BUFFERS` are ruby-specific and are not in the script's env
-list — export them in the shell before launching so they propagate through
-`srun --export=ALL`.)
+(`NCCL_SOCKET_IFNAME` and `NCCL_IB_GID_INDEX` are ruby-specific and are not in
+the script's env list — export them in the shell before launching so they
+propagate through `srun --export=ALL`.)
 
 Verified working with a 2-node `reduce_scatter_perf -d bfloat16 -b 8 -e 1G -f 2`
 (16 ranks, srun `--mpi=pmi2`): 0 `#wrong`, ~335 GB/s busbw at 1 GB.
