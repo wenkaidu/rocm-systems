@@ -2,9 +2,11 @@
 name: launch-rccl-tests-slurm
 description: >-
   Launch rccl-tests inside a SLURM allocation to exercise the IB net-checksum
-  feature on this branch. Use when the user wants to run rccl-tests, the csum
-  stress/debug/single/soak sweeps, or any multi-node RCCL collective run under
-  sbatch/salloc/srun on this cluster.
+  feature on this branch, or to benchmark collective latency across env-var
+  combinations and node counts. Use when the user wants to run rccl-tests, the
+  csum stress/debug/single/soak sweeps, an env-var on/off combination latency
+  sweep, or any multi-node RCCL collective run under sbatch/salloc/srun on this
+  cluster.
 disable-model-invocation: true
 ---
 
@@ -26,6 +28,8 @@ pattern, env wiring, and result-parsing logic:
 - [scripts/run_csum_stress.sh](scripts/run_csum_stress.sh) — full multi-node stress sweep (srun launcher).
 - [scripts/run_csum_single.sh](scripts/run_csum_single.sh) — single-node intra-net sweep.
 - [scripts/run_csum_stress_soak.sh](scripts/run_csum_stress_soak.sh) — repeat the stress sweep across cap configs.
+- [scripts/run_env_combo_sweep.sh](scripts/run_env_combo_sweep.sh) — benchmark a collective across every ON/OFF combination of a set of env vars, node counts, and repeat cycles (data collection).
+- [scripts/parse_env_combo_latency.py](scripts/parse_env_combo_latency.py) — parse that sweep into per-node-count median-latency Markdown tables (parsing).
 
 ## Prerequisites
 
@@ -149,6 +153,64 @@ propagate through `srun --export=ALL`.)
 
 Verified working with a 2-node `reduce_scatter_perf -d bfloat16 -b 8 -e 1G -f 2`
 (16 ranks, srun `--mpi=pmi2`): 0 `#wrong`, ~335 GB/s busbw at 1 GB.
+
+## Env-var combination latency sweeps
+
+To A/B (or N-way) compare RCCL/NCCL env-var settings on a collective's latency
+across scales, use the generic sweep + parse pair. It runs one full size sweep
+of a collective for **every ON/OFF (0/1) combination** of the named env vars, at
+each node count, repeated over several cycles, then reports the **per-size
+median** latency (median rejects run-to-run outliers).
+
+`run_env_combo_sweep.sh` is configured entirely through the environment:
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `COLL` | `alltoall_perf` | any rccl-tests `*_perf` binary |
+| `SWEEP_VARS` | `NCCL_ALLOC_P2P_NET_LL_BUFFERS RCCL_GFX9_CHEAP_FENCE_OFF` | space-separated env vars, each toggled 0/1 → 2^k combos |
+| `NODE_COUNTS` | `1 2 4 8 16` | node counts to test (all must fit in the allocation) |
+| `CYCLES` | `5` | repeats per combo (outer loop, spread in time) |
+| `FLAGS` | `-b 8 -e 1G -f 2 -g 1` | rccl-tests size-sweep flags |
+| `RCCL_LIB_DIR` | `~/rccl_libs/sel` | dir containing the `librccl.so.1` under test |
+| `RCCL_TESTS_BIN_DIR` | `~/rccl-tests/build` | where `$COLL` lives |
+| `OUT` | `~/logs/env_combo_sweep` | output dir (logs + `sweep_meta.env`) |
+
+Cost is `len(NODE_COUNTS) × 2^k × CYCLES` runs — e.g. the defaults are
+`5 × 4 × 5 = 100` runs (~30 min on 16 nodes). Add a var and it doubles.
+
+**Pin the library under test** by pointing `librccl.so.1` at a specific build.
+rccl-tests links `librccl.so.1`, so front-load a dir that resolves it:
+
+```bash
+mkdir -p ~/rccl_libs/sel
+ln -sf ~/rccl_libs/librccl.so.1.0.<hash> ~/rccl_libs/sel/librccl.so.1
+```
+
+Launch inside an allocation sized to the largest node count. `meta64`
+interactive allocations are capped at **240 minutes** (use `sbatch` for longer):
+
+```bash
+# example: sweep two vars for alltoall on 1/2/4/8/16 nodes, 5 cycles
+salloc -p meta64 -N 16 --ntasks-per-node=8 -t 3:59:00 \
+  bash .cursor/skills/launch-rccl-tests-slurm/scripts/run_env_combo_sweep.sh
+```
+
+These are long; start them in the background (`nohup ... &`) and monitor the
+run count (`ls $OUT/att__*.log | wc -l`) or `grep RUN $OUT/driver.log | tail`.
+
+Then build the tables (one per node count; columns = combos labelled `A0B1…`
+with a legend mapping each letter to its env var):
+
+```bash
+python3 .cursor/skills/launch-rccl-tests-slurm/scripts/parse_env_combo_latency.py \
+  ~/logs/env_combo_sweep            # writes latency_by_size.md in that dir
+```
+
+Latency is the out-of-place `time` (µs) column; sub-rank-count sizes that round
+to 0 B are dropped. Env effects are usually strongly size- and scale-dependent,
+so read the per-size tables rather than a single sweep-averaged number — a knob
+that helps small messages at 16 nodes may regress the mid-size band and be pure
+noise on 1 node.
 
 ## Why srun (not mpirun) inside an allocation
 
