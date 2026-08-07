@@ -33,6 +33,19 @@ pattern, env wiring, and result-parsing logic:
 - rccl-tests `*_perf` binaries at `~/rocm-systems/projects/rccl-tests/build`.
 - An active SLURM allocation (the scripts need `SLURM_JOB_ID` in the env).
 
+> **Always build RCCL from clean.** RCCL's device-kernel link step (`device.elf`)
+> does not list the per-kernel object files as make prerequisites — they are
+> passed to the linker via a response file — so an incremental `make` can report
+> "Built target" while silently re-linking **stale device code**. Edits to device
+> headers/sources (`prims_*.h`, `sendrecv.h`, etc.) then never reach the running
+> `librccl.so`, and you end up debugging a binary that does not match your source
+> (e.g. a "fixed" hang that still reproduces). A full clean RCCL build only takes
+> ~2 minutes, so always build from clean rather than incrementally. If you must
+> build incrementally, force the device relink by removing the stale products
+> first, e.g. `rm -f build/release/device_build/-*/device.elf
+> build/release/device_build/device.hipfb build/release/device_build/common.o
+> build/release/librccl.so.1.0` before `make`.
+
 ## Step 1: Confirm / get an allocation
 
 Check for an existing allocation first:
