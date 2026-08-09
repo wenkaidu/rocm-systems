@@ -62,6 +62,8 @@ Export normal `NCCL_*` / `RCCL_*` tuning yourself before launching.
 | [scripts/run_static_vs_dyn.sh](scripts/run_static_vs_dyn.sh) | **Compare a statically-linked rccl-tests (rccl baked into the binary from a `librccl*.a`) against the SAME source linked dynamically** across several `librccl.so` builds, interleaved per cycle. Env: **`STATIC_BIN_DIR`** (empty to skip static), **`STATIC_TAG`**, **`STATIC_ALGO_PROXY`** (same-era `.so` for the static binary's `-M` algo query), **`DYN_BIN_DIR`**, **`DYN_LIBS`** (abs paths or `RCCL_LIB_DIR` suffixes), **`COLLECTIVES`**, **`CYCLES`**, **`DTYPE`**, sweep knobs. Writes `results.csv` with per-size `algo/proto/#channels`. |
 | [scripts/report_static_vs_dyn.py](scripts/report_static_vs_dyn.py) | Summarize a `run_static_vs_dyn.sh` `results.csv`: per-collective median-oop tables with **delta% vs baseline** (default `static`), a geomean line, and an algo/proto:#channels table to confirm all configs took the same path. Args: `[results.csv] [baseline_tag]`. |
 | [scripts/submit_static_vs_dyn.sbatch](scripts/submit_static_vs_dyn.sbatch) | **`sbatch`** wrapper for `run_static_vs_dyn.sh`; `OUT_DIR` gets a `_<N>n` suffix. Submit per node count: `sbatch -N <n> --export=ALL,DYN_LIBS=..,OUT_DIR_BASE=.. submit_static_vs_dyn.sbatch`. |
+| [scripts/submit_unittests_build.sbatch](scripts/submit_unittests_build.sbatch) | **`sbatch`** build job for the chained build→test pipeline: incrementally builds `librccl` + `rccl-UnitTests`. Chain the run job with `--dependency=afterok`. |
+| [scripts/submit_unittests_run.sbatch](scripts/submit_unittests_run.sbatch) | **`sbatch`** run job: runs the full `rccl-UnitTests` suite (override `GTEST_FILTER`) as a single task, sets `LD_LIBRARY_PATH` (build + OMPI), writes a persistent result file with a PASS/FAIL summary + exit code. |
 | [scripts/common_rccl_tests_slurm.sh](scripts/common_rccl_tests_slurm.sh) | Shared bash helpers (sourced by the runners). |
 | [scripts/submit_rccl_tests_slurm.sh](scripts/submit_rccl_tests_slurm.sh) | **`sbatch`** wrapper: queue any runner on `amd-rccl` (defaults match `srun --pty -N 2 -C block3\|block4 --ntasks-per-node=64 --gres=gpu:8 -p amd-rccl -t 4:00:00 --qos=urgent`). |
 
@@ -411,6 +413,82 @@ explicitly for multi-node scripts.
 Each run writes per-collective logs and **`SUMMARY.txt`** with exit status,
 aggregated `#wrong` from rccl-tests tables, and counts of `NCCL`/`RCCL`
 `WARN`/`ERROR` lines.
+
+## Chained sbatch jobs (build → test) that outlive your interactive allocation
+
+Long unit-test or benchmark runs (`rccl-UnitTests`, multi-hour soaks) will
+outlast a `salloc`/interactive `srun` that is reclaimed when your session ends.
+Split the work into **two `sbatch` jobs — a build job and a run job chained with
+`--dependency=afterok`** — so the run only starts if the build succeeds and both
+survive session cleanup (they are owned by `slurmctld`, not your shell):
+
+Ready-made scripts for this are
+[scripts/submit_unittests_build.sbatch](scripts/submit_unittests_build.sbatch)
+and [scripts/submit_unittests_run.sbatch](scripts/submit_unittests_run.sbatch):
+
+```bash
+JID_BUILD=$(sbatch --parsable scripts/submit_unittests_build.sbatch)  # build librccl + tests
+JID_RUN=$(sbatch --parsable --dependency=afterok:$JID_BUILD scripts/submit_unittests_run.sbatch)
+echo "$JID_BUILD $JID_RUN" > ~/logs/ut_jobids.txt                     # persist ids
+```
+
+Each script carries its own `#SBATCH` header (this site: `--partition=meta64
+--account=vip --qos=normal`, 8 GPUs/node — read them off a running job with
+`scontrol show job <id> | grep -oE 'Account=[^ ]+|Partition=[^ ]+|QOS=[^ ]+'`)
+and writes to a **persistent log** (`--output=%x.%j.log`) plus a final results
+file, so the verdict is readable after your allocation is gone. The run script
+`tee`s the full output and ends with a summary + exit code:
+
+```bash
+stdbuf -oL -eL "$BUILD/test/rccl-UnitTests" 2>&1 | tee -a "$RESULT"
+rc=${PIPESTATUS[0]}; echo "rc=$rc"; grep -E '\[  (PASSED|FAILED)  \]' "$RESULT" | tail
+```
+
+Watch the build finish **before** you end your turn (an `afterok` dependency
+cancels the run job if the build fails). Check status later with
+`squeue -j <run_jid>` (empty = finished) and `tail ~/logs/<results>.txt`.
+
+Gotchas:
+
+- **Never `exec` a shared library** to print its version — running
+  `"$BUILD/librccl.so"` directly segfaults. Print the RCCL banner via a test
+  binary with `NCCL_DEBUG=VERSION` instead.
+- `rccl-UnitTests` is a **single task** (`--ntasks-per-node=1`) that forks its
+  own child processes for the multi-process (MP) cases and uses all 8 GPUs on the
+  node. It needs `librccl.so` **and** the OMPI runtime on `LD_LIBRARY_PATH`
+  (`/opt/sre-tools/ompi/lib`, for `libmpi.so.40`); rccl-tests `*_perf` binaries
+  additionally need `srun --mpi=pmix` to launch ranks.
+
+## Forcing intra-node send/recv over the network (single node)
+
+To exercise **network-transport** code paths on a single node — e.g. the P2P
+LL/LL128 net staging buffers governed by `NCCL_ALLOC_P2P_NET_LL_BUFFERS`, or an
+IB checksum feature — you must make intra-node peers use the `NET` transport
+instead of the faster on-node transports. `RCCL_ENABLE_INTRANET=1` alone is
+**not** enough: it only keeps the NIC in the single-node topology (prevents
+trimming); the transport selector still prefers P2P/IPC, then SHM. Empirically
+(`NCCL_DEBUG=INFO` `via …` connection lines):
+
+| Env on a single node | Transport actually used |
+|----------------------|-------------------------|
+| `RCCL_ENABLE_INTRANET=1` only | `via P2P/IPC` — net **not** used |
+| `+ NCCL_P2P_DISABLE=1` | `via SHM` — net **not** used |
+| `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` | `via NET/IB/*/GDRDMA` (incl. `/Shared`) |
+
+So set **`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1`** (RCCL_ENABLE_INTRANET is not
+even required once both are disabled). **Always verify** the path was actually
+taken rather than assuming — a test that silently falls back to P2P/IPC makes any
+net-only env var a no-op (a false pass):
+
+```bash
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT <binary> 2>&1 \
+  | grep -oE 'via (P2P/IPC|SHM|NET[^ ]*)' | sort | uniq -c
+# want: only 'via NET/...' lines (incl. the '/Shared' P2P-net connections that
+# carry shared!=0 send/recv, which is where NCCL_ALLOC_P2P_NET_LL_BUFFERS applies)
+```
+
+This is how the SendRecv LL128 net-buffer unit tests are pinned to the network
+path for both `NCCL_ALLOC_P2P_NET_LL_BUFFERS=0` and `=1`.
 
 ## Copying into `tools/` (optional)
 

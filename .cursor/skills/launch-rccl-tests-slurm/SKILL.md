@@ -105,7 +105,7 @@ and `scontrol show hostnames`, so do NOT hand-edit host lists when in an alloc.
 |--------|-----------|
 | `tools/run_csum_debug.sh` | One quick cross-node AllReduce (64M) — fastest sanity check. |
 | `tools/run_csum_stress.sh` | Full multi-node sweep over every `*_perf` collective, `-b 8 -e 1G`, with validation. |
-| `tools/run_csum_single.sh` | Single-node sweep (flips `RCCL_ENABLE_INTRANET=1` + `RCCL_P2P_NET_DISABLE=0` so intra-node pairs route over IB). |
+| `tools/run_csum_single.sh` | Single-node sweep (flips `RCCL_ENABLE_INTRANET=1` + `RCCL_P2P_NET_DISABLE=0` so intra-node pairs route over IB). **Verify the NET path was actually taken** — `RCCL_ENABLE_INTRANET=1` alone routes `via P2P/IPC`; see "Forcing intra-node send/recv over the network" below. |
 | `tools/run_csum_stress_soak.sh` | Repeat the stress sweep N cycles per `RCCL_IB_RDMA_CHECKSUM_BYTES` cap to catch intermittent failures. |
 
 ## Step 3: Launch
@@ -259,6 +259,76 @@ to 0 B are dropped. Env effects are usually strongly size- and scale-dependent,
 so read the per-size tables rather than a single sweep-averaged number — a knob
 that helps small messages at 16 nodes may regress the mid-size band and be pure
 noise on 1 node.
+
+## Chained sbatch jobs (build → test) that outlive your interactive allocation
+
+Long unit-test or benchmark runs (`rccl-UnitTests`, multi-hour soaks) will
+outlast a `salloc`/interactive `srun` that is reclaimed when your session ends.
+Split the work into **two `sbatch` jobs — a build job and a run job chained with
+`--dependency=afterok`** — so the run only starts if the build succeeds and both
+survive session cleanup (they are owned by `slurmctld`, not your shell):
+
+```bash
+cd ~/logs
+JID_BUILD=$(sbatch --parsable ut_build.sbatch)                        # build librccl + tests
+JID_RUN=$(sbatch --parsable --dependency=afterok:$JID_BUILD ut_run.sbatch)
+echo "$JID_BUILD $JID_RUN" > ut_jobids.txt                            # persist ids
+```
+
+Each script carries its own `#SBATCH` header (this site: `--partition=meta64
+--account=vip --qos=normal`, 8 GPUs/node — read them off a running job with
+`scontrol show job <id> | grep -oE 'Account=[^ ]+|Partition=[^ ]+|QOS=[^ ]+'`)
+and writes to a **persistent log under `~/logs`** (`--output=…%j.log`) plus a
+final results file, so the verdict is readable after your allocation is gone.
+The run script should `tee` the full output and end with a summary + exit code:
+
+```bash
+stdbuf -oL -eL "$BUILD/test/rccl-UnitTests" 2>&1 | tee -a "$RESULT"
+rc=${PIPESTATUS[0]}; echo "rc=$rc"; grep -E '\[  (PASSED|FAILED)  \]' "$RESULT" | tail
+```
+
+Watch the build finish **before** you end your turn (an `afterok` dependency
+cancels the run job if the build fails). Check status later with
+`squeue -j <run_jid>` (empty = finished) and `tail ~/logs/<results>.txt`.
+
+Gotchas:
+
+- **Never `exec` a shared library** to print its version — running
+  `"$BUILD/librccl.so"` directly segfaults. Print the RCCL banner via a test
+  binary with `NCCL_DEBUG=VERSION` instead.
+- `rccl-UnitTests` is a **single task** (`--ntasks-per-node=1`) that forks its
+  own child processes for the multi-process (MP) cases and uses all 8 GPUs on the
+  node. It needs `librccl.so` **and** the OMPI runtime on `LD_LIBRARY_PATH`
+  (`/opt/sre-tools/ompi/lib`, for `libmpi.so.40`); rccl-tests `*_perf` binaries
+  additionally need `srun --mpi=pmix` to launch ranks.
+
+## Forcing intra-node send/recv over the network (single node)
+
+To exercise **network-transport** code paths on a single node — e.g. the P2P
+LL/LL128 net staging buffers governed by `NCCL_ALLOC_P2P_NET_LL_BUFFERS`, or the
+IB checksum feature — you must make intra-node peers use the `NET` transport
+instead of the faster on-node transports. `RCCL_ENABLE_INTRANET=1` alone is
+**not** enough: it only keeps the NIC in the single-node topology (prevents
+trimming); the transport selector still prefers P2P/IPC, then SHM. Empirically
+(`NCCL_DEBUG=INFO` `via …` connection lines):
+
+| Env on a single node | Transport actually used |
+|----------------------|-------------------------|
+| `RCCL_ENABLE_INTRANET=1` only | `via P2P/IPC` — net **not** used |
+| `+ NCCL_P2P_DISABLE=1` | `via SHM` — net **not** used |
+| `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` | `via NET/IB/*/GDRDMA` (incl. `/Shared`) |
+
+So set **`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1`** (RCCL_ENABLE_INTRANET is not
+even required once both are disabled). **Always verify** the path was actually
+taken rather than assuming — a test that silently falls back to P2P/IPC makes any
+net-only env var a no-op (a false pass):
+
+```bash
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT <binary> 2>&1 \
+  | grep -oE 'via (P2P/IPC|SHM|NET[^ ]*)' | sort | uniq -c
+# want: only 'via NET/...' lines (incl. the '/Shared' P2P-net connections that
+# carry shared!=0 send/recv, which is where NCCL_ALLOC_P2P_NET_LL_BUFFERS applies)
+```
 
 ## Why srun (not mpirun) inside an allocation
 
