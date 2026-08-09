@@ -15,11 +15,25 @@ Scripts live under `.cursor/skills/launch-rccl-tests-slurm/scripts/`. They are
 generic: they do not enable or document any checksum-specific RCCL options.
 Export normal `NCCL_*` / `RCCL_*` tuning yourself before launching.
 
+> **For long / unattended / multi-`N` sweeps, always use `sbatch`, never a
+> `nohup … salloc … &` driver.** A `salloc` (and any `nohup`-backgrounded loop
+> that owns it) belongs to the login-session process tree, so a session cleanup
+> — logout, agent/terminal teardown, idle reaper, or stray `scancel -n bash` —
+> kills the whole driver + `salloc` + `srun` tree and leaves the SLURM
+> allocations **orphaned** (holding nodes, doing nothing) with the sweep dead
+> partway through. `sbatch` jobs are owned by `slurmctld` and survive session
+> cleanup. **Submit one job per node count** (they run independently, often in
+> parallel): `for N in 1 2 4 8 16; do sbatch -N "$N" --ntasks-per-node=8 -t 3:00:00 -o ~/logs/sw_N$N.out --wrap "bash <inner>.sh"; done`.
+> If `squeue` shows running jobs with **no** matching `salloc`/`srun`/driver in
+> `ps -u "$USER"`, they are orphans — `scancel` and resubmit via `sbatch`. Use
+> `salloc` only for short interactive runs you actively watch.
+
 ## Prerequisites
 
 - **SLURM allocation** for multi-node runs (`salloc` / interactive `srun --pty`),
   **or** use [scripts/submit_rccl_tests_slurm.sh](scripts/submit_rccl_tests_slurm.sh)
-  to **queue via `sbatch`** (no shell on compute nodes required). The runners
+  to **queue via `sbatch`** (no shell on compute nodes required — and the
+  recommended path for long/unattended sweeps, see callout above). The runners
   recover the nodelist from `SLURM_JOB_ID` when the shell only inherited the job
   id (e.g. Cursor agent terminal).
 - **rccl-tests** `*_perf` binaries (default path `~/rocm-systems/projects/rccl-tests/build`).

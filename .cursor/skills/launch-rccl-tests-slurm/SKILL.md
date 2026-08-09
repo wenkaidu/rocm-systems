@@ -50,6 +50,31 @@ pattern, env wiring, and result-parsing logic:
 > build/release/device_build/device.hipfb build/release/device_build/common.o
 > build/release/librccl.so.1.0` before `make`.
 
+> **Always drive long / unattended sweeps with `sbatch`, never `nohup … salloc … &`.**
+> A `salloc` (or a `nohup`-backgrounded driver that owns a `salloc`) is tied to
+> the login-session process tree. When that session is cleaned up — logout, an
+> agent/terminal teardown, an idle-session reaper, or a stray `scancel -n bash` —
+> the **entire driver + `salloc` + `srun` tree is killed**, and the underlying
+> SLURM allocations are left **orphaned** (still holding nodes, doing nothing,
+> while the multi-`N` driver loop silently dies partway through). `sbatch` jobs
+> are owned by `slurmctld`, not your shell, so they survive session cleanup and
+> restart-safely record their own state. **Submit one `sbatch` job per node
+> count** so they are independent and can even run in parallel:
+>
+> ```bash
+> for N in 1 2 4 8 16; do
+>   sbatch --parsable -p meta64 -N "$N" --ntasks-per-node=8 -t 3:00:00 \
+>          -J sweep_N$N -o ~/logs/sweep_N${N}.out \
+>          --wrap "bash ~/logs/<inner_sweep>.sh"   # inner reads SLURM_NNODES
+> done
+> squeue -u "$USER" -o '%.8i %.9j %.2t %.6M %.5D %R'   # monitor
+> ```
+>
+> Only use `salloc` for short, interactive, actively-watched runs (a quick
+> sanity check you will not walk away from). If you ever see running jobs in
+> `squeue` with **no** matching `salloc`/`srun`/driver process in `ps -u "$USER"`,
+> they are orphans — `scancel` them and resubmit via `sbatch`.
+
 ## Step 1: Confirm / get an allocation
 
 Check for an existing allocation first:
@@ -60,11 +85,15 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"
 ```
 
 If `SLURM_JOB_ID` is set, reuse it (the scripts pass `--jobid` + `--overlap` so
-they attach to the existing alloc). If not, request one, e.g.:
+they attach to the existing alloc). If not, request one. For a **short,
+interactive** run you will actively watch, `salloc` is fine:
 
 ```bash
 salloc -p amd-rccl -N 2 --ntasks-per-node=8 --gpus-per-node=8 -t 60:00
 ```
+
+For anything **long or unattended, use `sbatch` instead** (see the callout above)
+— a `salloc`/`nohup` driver dies with your login session and orphans its nodes.
 
 The Cursor terminal may only inherit `SLURM_JOB_ID` (not the nodelist). That is
 fine — the scripts recover the nodelist via `squeue -h -j "$SLURM_JOB_ID" -o '%N'`
@@ -199,17 +228,23 @@ mkdir -p ~/rccl_libs/sel
 ln -sf ~/rccl_libs/librccl.so.1.0.<hash> ~/rccl_libs/sel/librccl.so.1
 ```
 
-Launch inside an allocation sized to the largest node count. `meta64`
-interactive allocations are capped at **240 minutes** (use `sbatch` for longer):
+These sweeps are long, so **submit them with `sbatch`, not `salloc`+`nohup`**
+(see the top-of-file callout — a `salloc` driver dies with your login session and
+orphans its nodes). Submit one job per node count so they are independent and can
+run in parallel:
 
 ```bash
 # example: sweep two vars for alltoall on 1/2/4/8/16 nodes, 5 cycles
-salloc -p meta64 -N 16 --ntasks-per-node=8 -t 3:59:00 \
-  bash .cursor/skills/launch-rccl-tests-slurm/scripts/run_env_combo_sweep.sh
+for N in 1 2 4 8 16; do
+  sbatch --parsable -p meta64 -N "$N" --ntasks-per-node=8 -t 3:59:00 \
+         -J envsweep_N$N -o ~/logs/envsweep_N${N}.out \
+         --wrap "NODE_COUNTS=$N bash .cursor/skills/launch-rccl-tests-slurm/scripts/run_env_combo_sweep.sh"
+done
 ```
 
-These are long; start them in the background (`nohup ... &`) and monitor the
-run count (`ls $OUT/att__*.log | wc -l`) or `grep RUN $OUT/driver.log | tail`.
+(`meta64` interactive allocations are capped at **240 minutes**, another reason
+to prefer batch jobs.) Monitor with `squeue -u "$USER"`, the run count
+(`ls $OUT/att__*.log | wc -l`), or `grep RUN $OUT/driver.log | tail`.
 
 Then build the tables (one per node count; columns = combos labelled `A0B1…`
 with a legend mapping each letter to its env var):
