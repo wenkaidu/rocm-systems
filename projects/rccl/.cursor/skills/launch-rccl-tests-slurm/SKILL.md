@@ -43,6 +43,23 @@ Export normal `NCCL_*` / `RCCL_*` tuning yourself before launching.
   `~/mpich/install/bin/mpirun`). Inside an allocation, **`srun --mpi=pmi2`** is
   preferred so ranks start without ssh.
 
+## Crusoe SSH (Cursor on the allocated node)
+
+On Crusoe login nodes, Cursor Remote-SSH / the agent stay on the **login** host.
+Compute host `:22` often rejects user pubkeys. To ssh (or open Cursor) on the
+allocated node, start a **user `sshd` on port 22222** inside the job — see
+[crusoe-ssh](../crusoe-ssh/SKILL.md) for the full steps and
+[scripts/start_user_sshd.sh](../crusoe-ssh/scripts/start_user_sshd.sh).
+
+```bash
+# from login: attach to your job and start user sshd
+srun --jobid="$JOBID" --overlap bash \
+  "$HOME/rocm-systems/projects/rccl/.cursor/skills/crusoe-ssh/scripts/start_user_sshd.sh"
+# then: ssh -p 22222 -i ~/.ssh/id_ed25519 <nodename>
+```
+
+Do **not** build RCCL or run heavy work on the login node.
+
 ## Scripts
 
 | Script | Purpose |
