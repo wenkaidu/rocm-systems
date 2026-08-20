@@ -54,12 +54,24 @@ ncclResult_t ncclRegister(struct ncclComm* comm, void* data, size_t size, bool i
     } else {
       // Check for a Sysmem segment is only valid with cuMem based allocators, so a IS_LEGACY_CUDA_IPC check is required to ensure
       // that we're calling ncclCuMemGetAddressRange only when necessary.
+#if defined(__HIP_PLATFORM_AMD__) && (ROCM_VERSION < 71200)
+      // [RCCL] ROCm <= 7.0.x: cuPointerGetAttribute(CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE)
+      // returns HIP "operation not supported", aborting registration whenever NCCL_CUMEM_ENABLE=1.
+      // Host-VMM (sysmem) segments only exist on ROCm >= 7.12 (see ncclCuMemHostAlloc), so on these
+      // versions a device buffer can never contain a sysmem segment. Skip the unsupported query and
+      // the segment walk, leaving hasSysmemSegment=false so registration proceeds as normal.
+      (void)legacyIpcCap;
+      (void)numSegments;
+      (void)base;
+      (void)baseSize;
+#else
       CUCHECK(cuPointerGetAttribute((void*)&legacyIpcCap, CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE,
                                     (CUdeviceptr)base));
       if (!legacyIpcCap) {
         NCCLCHECK(ncclCuMemGetAddressRange((CUdeviceptr)data, size, (CUdeviceptr*)&base, &baseSize, &numSegments,
                                            &hasSysmemSegment));
       }
+#endif
     }
   }
   if (hasSysmemSegment) {
