@@ -2,11 +2,13 @@
 name: launch-rccl-tests-slurm
 description: >-
   Launch rccl-tests inside a SLURM allocation to exercise the IB net-checksum
-  feature on this branch, or to benchmark collective latency across env-var
-  combinations and node counts. Use when the user wants to run rccl-tests, the
-  csum stress/debug/single/soak sweeps, an env-var on/off combination latency
-  sweep, or any multi-node RCCL collective run under sbatch/salloc/srun on this
-  cluster.
+  feature on this branch, benchmark collective latency across env-var
+  combinations and node counts, or build/test RCCL against specific ROCm
+  module versions on the single-node MI300A `lockhart` cluster. Use when the
+  user wants to run rccl-tests, the csum stress/debug/single/soak sweeps, an
+  env-var on/off combination latency sweep, a single-node gfx942/MI300A
+  build-and-test pass (e.g. ROCm version compatibility checks), or any RCCL
+  collective run under sbatch/salloc/srun on this cluster.
 disable-model-invocation: true
 ---
 
@@ -195,6 +197,73 @@ propagate through `srun --export=ALL`.)
 
 Verified working with a 2-node `reduce_scatter_perf -d bfloat16 -b 8 -e 1G -f 2`
 (16 ranks, srun `--mpi=pmi2`): 0 `#wrong`, ~335 GB/s busbw at 1 GB.
+
+## Lockhart cluster (single-node MI300A, gfx942)
+
+The `lockhart` cluster (partition `MI300A_A1`, node names like
+`x1001c0s1b1n0`) is a **single node with 4 MI300A GPUs** (gfx942), fed by
+Cray MPICH (`/opt/cray/pe/mpich/<ver>/ofi/crayclang/<ver>`) instead of
+OpenMPI. Multiple ROCm versions are available as modules (`module avail
+rocm`) under `/opt/COE_modules/rocm/rocm-<ver>/`; use `module show
+rocm/<ver>` to read off `ROCM_PATH` when building/testing against a
+specific version (e.g. to check backward compatibility of a change).
+
+### Build
+
+```bash
+# RCCL — target gfx942 only, both to save build time and to avoid pulling
+# in unrelated-arch failures (see gotcha below)
+ROCM_PATH=/opt/COE_modules/rocm/rocm-<ver> ./install.sh --amdgpu_targets gfx942 -j 96
+
+# rccl-tests — the Makefile reads ROCM_PATH, NOT HIP_HOME
+cd projects/rccl-tests
+make MPI=1 MPI_HOME=/opt/cray/pe/mpich/9.1.0/ofi/crayclang/20.0 \
+     ROCM_PATH=/opt/COE_modules/rocm/rocm-<ver> \
+     RCCL_HOME=<rccl_repo>/build/release NCCL_HOME=<rccl_repo>/build/release \
+     GPU_TARGETS=gfx942 -j 32
+```
+
+**Gotcha — `GPU_TARGETS`:** the default builds for `gfx906 gfx908 gfx90a
+gfx942 gfx950 gfx1030 gfx1100 …`. Compiling for the unrelated `gfx1030`
+target can fail on headers unrelated to your change (e.g. `nccl_device`
+template errors) and wastes build time. Always pass `GPU_TARGETS=gfx942`
+when you only need to test on this node.
+
+**Gotcha — `HIP_HOME` vs `ROCM_PATH`:** rccl-tests' `src/Makefile` derives
+the compiler as `$(ROCM_PATH)/llvm/bin/amdclang++`. Passing `HIP_HOME=`
+instead does nothing — the build silently falls back to whatever `hipcc` is
+first on `PATH` (check `hipcc --version`'s `InstalledDir` if you get symbol
+errors that don't match the ROCm version you intended).
+
+### Run
+
+The Cursor/agent shell attached to an allocation typically does **not**
+have `SLURM_JOB_ID` set (the login/agent shell is not the job's own shell),
+so a bare `srun` will silently schedule a brand-new job — possibly on a
+different, GPU-less node/partition. Always check `squeue --me` for your job
+id first, then:
+
+```bash
+# single process, all 4 GPUs — no srun needed, just run the binary
+LD_LIBRARY_PATH=<rccl_repo>/build/release:$ROCM_PATH/lib:$LD_LIBRARY_PATH \
+  ./build/all_reduce_perf -b 8 -e 256M -f 2 -g 4
+
+# 1 GPU per MPI rank — explicit --jobid + --overlap; the interactive shell
+# already occupies step .0 on that job, and --overlap lets a new step share it
+LD_LIBRARY_PATH=<rccl_repo>/build/release:$ROCM_PATH/lib:$LD_LIBRARY_PATH \
+  srun --jobid=<job_id> --overlap -N1 -n4 ./build/all_reduce_perf -b 8 -e 256M -f 2 -g 1
+```
+
+**Gotcha — do not add GPU-binding flags** (`--gpus-per-task=1`,
+`--gpu-bind=…`) to the `srun` above. rccl-tests picks each rank's device as
+`localRank*nGpus + i` (`src/util.cu`), assuming **all** GPUs stay visible to
+every rank; restricting visibility per task makes ranks >0 see only 1
+device and fail with `Invalid number of GPUs: N requested but only 1 were
+found`. Leave GPU visibility unrestricted and let the app index into the
+full set.
+
+Verify GPUs are idle/healthy before/after a run with `rocm-smi` (0% GPU%,
+low power draw, no stray `all_reduce_perf`/`srun` processes in `ps aux`).
 
 ## Env-var combination latency sweeps
 
