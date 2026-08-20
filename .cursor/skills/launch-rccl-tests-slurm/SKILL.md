@@ -265,6 +265,22 @@ full set.
 Verify GPUs are idle/healthy before/after a run with `rocm-smi` (0% GPU%,
 low power draw, no stray `all_reduce_perf`/`srun` processes in `ps aux`).
 
+### Checking ROCm version compatibility
+
+To verify a change doesn't regress against older ROCm releases, repeat the
+build+run above once per `module avail rocm` version (rebuild RCCL **and**
+rccl-tests from clean each time — `rm -rf build` — since headers/ABI differ
+across versions). Known results for the `HIP_HOST_UNCACHED_MEMORY` /
+uncached-host-alloc change (PR #8352, commit `faa9111f85`):
+
+| ROCm version | Result |
+|---|---|
+| 6.4.3 | ❌ fails — pre-existing, unrelated bug: `src/misc/rocmwrap.cc` sets `prop.requestedHandleTypes` (plural) unconditionally, but 6.4.3's `hipMemAllocationProp` only has the singular `requestedHandleType`. Needs a `#if NCCL_CUMEM_VERSION_SUPPORTED(HIP_VERSION)` guard (see `src/include/rocmwrap.h`) to fix; not caused by this PR. |
+| 7.0.0 | ✅ pass (0 wrong) — missing `hipMemcpyBatchAsync`/`hipMemLocationTypeHostNuma` natively, but `nccl_device` already falls back to `CU_MEM_LOCATION_TYPE_HOST_NUMA`, so it's just a benign `-Wtautological-constant-out-of-range-compare` warning, not a build error. |
+| 7.1.0 | ✅ pass (0 wrong) — has all symbols the PR touches. |
+| 7.2.0 | ✅ pass (0 wrong) — has all symbols the PR touches. |
+| 7.13.0-gfx94x | ✅ pass (0 wrong) — reference/primary build target. |
+
 ## Env-var combination latency sweeps
 
 To A/B (or N-way) compare RCCL/NCCL env-var settings on a collective's latency
