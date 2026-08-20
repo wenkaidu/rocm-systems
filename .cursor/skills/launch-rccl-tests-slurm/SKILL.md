@@ -208,6 +208,23 @@ rocm`) under `/opt/COE_modules/rocm/rocm-<ver>/`; use `module show
 rocm/<ver>` to read off `ROCM_PATH` when building/testing against a
 specific version (e.g. to check backward compatibility of a change).
 
+### Allocation
+
+Request the node with `-G 4` (4 GPUs) — without it the allocation has no
+GPUs bound:
+
+```bash
+srun -N 1 -n 64 -G 4 -p MI300A_A1_COS_OK --pty bash -i
+```
+
+Once on the allocated node, the ROCm modulefiles live under a non-default
+path, so add it before loading a version:
+
+```bash
+module use /opt/COE_modules/modulefiles/rocm
+module load rocm/7.13.0-gfx94x
+```
+
 ### Build
 
 ```bash
