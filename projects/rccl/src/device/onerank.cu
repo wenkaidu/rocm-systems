@@ -7,6 +7,7 @@
 
 #include "alloc.h"
 #include "collectives.h"
+#include "common.h"
 #include "common_kernel.h"
 #include <cuda_runtime.h>
 

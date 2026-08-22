@@ -1703,9 +1703,10 @@ TEST_F(P2pMPITest, IpcGraphRegisterBufferTest)
 }
 
 // ROCM-26926: Verify P2P send/recv correctness when the P2P batch auto-enable
-// path is gated on multi-node.  With RCCL_P2P_BATCH_ENABLE unset (default -1),
-// rcclEffectiveP2pBatchEnable returns 0 for single-node communicators
-// (comm->nNodes <= 1), so the channel-base mapping matches pre-7.14 behaviour.
+// path is gated on multi-node for non-gfx1250. With RCCL_P2P_BATCH_ENABLE
+// unset (default -1), rcclEffectiveP2pBatchEnable returns 0 for single-node
+// non-gfx1250 communicators. gfx1250 auto-enables batching; single-node
+// channel base is still p2pRound, so this send/recv check remains valid.
 TEST_F(P2pMPITest, P2pBatchAutoDisableOnSingleNode)
 {
     if(getenv("RCCL_P2P_BATCH_ENABLE"))

@@ -10,6 +10,7 @@
 #include "comm.h"
 #include "utils.h"
 #include "param.h"
+#include "archinfo.h"
 
 bool rcclUseAinic();
 
@@ -30,7 +31,8 @@ inline uint8_t ncclP2pChannelBaseForRound(struct ncclComm* comm, int p2pRound, i
     int nodeDelta = p2pRound / comm->maxLocalRanks;
     int localDelta = p2pRound % comm->maxLocalRanks;
     int fallbackBatch = (!ncclPxnDisable(comm) && rcclParamPxnOptQpUsage() && rcclUseAinic()) ? comm->maxLocalRanks : 1;
-    int batchSize = (comm->nNodes > 2 && p2pBatchEnable) ? NCCL_MAX_DEV_WORK_P2P_PER_BATCH : fallbackBatch;
+    const bool gfx1250 = comm->archName && IsArchMatch(comm->archName, "gfx1250");
+    int batchSize = (p2pBatchEnable && (comm->nNodes > 2 || gfx1250)) ? NCCL_MAX_DEV_WORK_P2P_PER_BATCH : fallbackBatch;
     base = nodeDelta * divUp(comm->maxLocalRanks, batchSize);
     base += localDelta / batchSize;
   } else {

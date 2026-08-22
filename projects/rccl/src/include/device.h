@@ -748,6 +748,35 @@ __host__ __device__ constexpr int ncclNvlsUnroll(int bytePerPack, int cudaArch =
   return ncclCalcUnroll(bytePerPack, ncclNvlsUnrollInsns(cudaArch), ncclNvlsUnrollBytes(cudaArch));
 }
 
+// gfx1250 TDM: one 1-D op's extent is a 16-bit descriptor field (max 65535 B).
+// LDS is 320 KiB per CU (hipDeviceProp.sharedMemPerBlock). Ping-pong uses the
+// whole per-warp scratch as two windows, so the per-op tile is TILE/2. 8 warps
+// in a 256-thread block cannot all hold a 64 KiB window; LDS is the limit.
+#ifndef RCCL_TDM_DESC_MAX_BYTES
+#define RCCL_TDM_DESC_MAX_BYTES 65535
+#endif
+#ifndef RCCL_GFX1250_LDS_BYTES
+#define RCCL_GFX1250_LDS_BYTES 327680
+#endif
+#ifndef RCCL_TDM_SHMEM_RESERVE_BYTES
+#define RCCL_TDM_SHMEM_RESERVE_BYTES (32 << 10)
+#endif
+
+__host__ __device__ constexpr int rcclTdmTileBytes() {
+#if defined(__gfx1250__)
+  constexpr int nWarps = NCCL_MAX_NTHREADS / WARP_SIZE;
+  constexpr int raw = (RCCL_GFX1250_LDS_BYTES - RCCL_TDM_SHMEM_RESERVE_BYTES) / nWarps;
+  constexpr int aligned = raw & ~255; // 256 B, matches TDM's preferred row grain
+  return aligned < 256 ? 256 : aligned;
+#else
+  return 2048;
+#endif
+}
+
+#ifndef RCCL_TDM_TILE_BYTES
+#define RCCL_TDM_TILE_BYTES rcclTdmTileBytes()
+#endif
+
 // The amount of dynamic shmem per warp
 __device__ constexpr int ncclShmemScratchWarpSize(int cudaArch = NCCL_CUDA_ARCH) {
   return (max_constexpr<int>(
@@ -755,7 +784,8 @@ __device__ constexpr int ncclShmemScratchWarpSize(int cudaArch = NCCL_CUDA_ARCH)
             /*LL128 */ (NCCL_LL128_SHMEM_ELEMS_PER_THREAD * WARP_SIZE) * sizeof(uint64_t),
             /*SIMPLE*/ (ncclCollUnroll(cudaArch) * WARP_SIZE + 1) * 16,
             // NVLS needs an extra 16B to read unaligned data.
-            /*NVLS  */ WARP_SIZE * (cudaArch >= 900 ? ncclNvlsUnrollBytes(cudaArch) : 0) + 16) +
+            /*NVLS  */ WARP_SIZE * (cudaArch >= 900 ? ncclNvlsUnrollBytes(cudaArch) : 0) + 16,
+            /*TDM   */ rcclTdmTileBytes()) +
           15) &
          -16; // pad to 16 bytes
 }

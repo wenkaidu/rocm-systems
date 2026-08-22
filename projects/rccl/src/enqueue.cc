@@ -63,7 +63,8 @@ constexpr int rcclShmemScratchWarpSize(int cudaArch = NCCL_CUDA_ARCH, int WarpSi
             /*LL128 */ (NCCL_LL128_SHMEM_ELEMS_PER_THREAD * WarpSize) * sizeof(uint64_t),
             /*SIMPLE*/ (ncclCollUnroll(cudaArch) * WarpSize + 1) * 16,
       // NVLS needs an extra 16B to read unaligned data.
-            /*NVLS  */ WarpSize * (cudaArch >= 900 ? ncclNvlsUnrollBytes(cudaArch) : 0) + 16) +
+            /*NVLS  */ WarpSize * (cudaArch >= 900 ? ncclNvlsUnrollBytes(cudaArch) : 0) + 16,
+            /*TDM   */ rcclTdmTileBytes()) +
           15) &
          -16; // pad to 16 bytes
 }
@@ -225,8 +226,11 @@ static void addWorkBatchToPlan(struct ncclComm* comm, struct ncclKernelPlan* pla
     // batch further down.
     if (workType == ncclDevWorkTypeP2p) {
       newBatch |= !chan->wipBatch.batchP2P;
-      newBatch |= (comm->nNodes > 2 && batchP2P) ? (chan->wipBatch.nP2ps == NCCL_MAX_DEV_WORK_P2P_PER_BATCH) :
-                                                   (chan->wipBatch.nP2ps == 1);
+      // gfx1250 packs P2P works on any node count so a sendrecv kernel can
+      // hold multiple copies and each warp issues its own TDM request.
+      const bool packP2p =
+        batchP2P && (comm->nNodes > 2 || IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx1250"));
+      newBatch |= packP2p ? (chan->wipBatch.nP2ps == NCCL_MAX_DEV_WORK_P2P_PER_BATCH) : (chan->wipBatch.nP2ps == 1);
       for (int i = 0; i < chan->wipBatch.nP2ps; i++) {
         newBatch |= p2pRound == chan->wipBatch.p2pRounds[i];
         // Make sure we only aggregate p2p operations within the same p2p round epoch (one epoch is NCCL_MAX_DEV_WORK_P2P_PER_BATCH ops).
@@ -1163,12 +1167,16 @@ NCCL_PARAM(ChunkSize, "CHUNK_SIZE", 0);
 // previously, p2p-batching was causing regression on all node-counts for larger message sizes (64KB "per-rank")
 // we want to auto-enable only for gfx950 paired with a non-AINIC NIC, so we use
 // rcclEffectiveP2pBatchEnable helper to branch based on arch and NIC type.
+// gfx1250 always auto-enables: TDM copies are issued per warp, so packing
+// multiple P2P works into one kernel lets each warp submit its own TDM request.
 RCCL_PARAM(P2pBatchEnable, "P2P_BATCH_ENABLE", -1);
 RCCL_PARAM(P2pBatchThreshold, "P2P_BATCH_THRESHOLD", 1 << 16); // 64k per-rank message size
 
 static int rcclEffectiveP2pBatchEnable(struct ncclComm* comm) {
   auto userInput = rcclParamP2pBatchEnable();
   if (userInput >= 0) return userInput;
+  bool isGfx1250 = IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx1250");
+  if (isGfx1250) return 1;
   if (comm->nNodes <= 1) return 0;
   bool isGfx950 = IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950");
   return (isGfx950 && !rcclUseAinic()) ? 1 : 0;

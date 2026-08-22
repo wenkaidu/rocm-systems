@@ -12,12 +12,16 @@
 #include "op128.h"
 #include "nccl_device/utility.h"
 #include "reduce_kernel.h"
+#include "amd_tdm.h"
 #include <cstdio>
 #include <cstdint>
 
 #include <hip/hip_runtime.h>
 
 #define __syncwarp()
+
+// Per-wave TDM staging size is RCCL_TDM_TILE_BYTES (see device.h). Ping-pong
+// windows are TILE/2 so each op stays within the 16-bit descriptor max.
 
 // Define min for ssize_t
 inline __device__ int min(int a, ssize_t b) {
@@ -200,6 +204,76 @@ __device__ __forceinline__ static void reduceCopyPacks(int nThreads, int& thread
   // This effectively assigns: warp = (warp-nHunks+nWarps)%nWarps;
   warp = -nHunksAhead;
   thread = warp * WARP_SIZE + lane;
+}
+
+// Per-warp view into the block-wide TDM staging buffer. Non-templated so a
+// single __shared__ allocation is shared by every reduceCopyPacksTdm
+// instantiation compiled into the kernel (rather than one per type).
+// Stage through the existing per-warp scratch so TDM does not add a second
+// block-wide __shared__ allocation (that overflowed LDS when instantiated in
+// every copy-shaped reduceCopy). Indexed by workgroup warp.
+__device__ __forceinline__ char* ncclTdmStageForWarp(int globalWarp) {
+  return (char*)ncclScratchForWarp(globalWarp);
+}
+
+// Copy-only TDM variant of reduceCopyPacks: moves the whole [nBytesBehind,
+// nBytesBehind+nBytesAhead) range from the single source to every destination
+// using the AMD Tensor Data Mover, staging through LDS (global -> LDS ->
+// global). This is only valid for a pure copy: one src, no multimem / preop /
+// postop / accumulate (the caller guarantees this in reduceCopy).
+//
+// Warps stripe over the buffer: warp w owns the tiles at byte offsets
+// w*Tile, (w+nWarps)*Tile, ... Each warp submits its own TDM requests. A
+// two-deep ping-pong in the per-warp staging tile overlaps store of tile i
+// with load of tile i+1. On return the whole range is consumed
+// (nBytesAhead == 0). No workgroup barrier is used.
+template <typename RedFn, typename T, int Unroll, int BytePerPack, int MultimemSrcs, int MinSrcs, int MaxSrcs,
+          int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs, typename IntBytes, typename SrcPtrFn,
+          typename DstPtrFn>
+__device__ __forceinline__ static void reduceCopyPacksTdm(int nThreads, int& thread, int nSrcs,
+                                                          SrcPtrFn const& srcPtrFn, int nDsts, DstPtrFn const& dstPtrFn,
+                                                          IntBytes& nBytesBehind, IntBytes& nBytesAhead) {
+  static_assert(std::is_signed<IntBytes>::value, "IntBytes must be a signed integral type.");
+  constexpr IntBytes Tile = RCCL_TDM_TILE_BYTES / 2;
+  static_assert(Tile > 0 && Tile <= RCCL_TDM_DESC_MAX_BYTES,
+                "TDM ping-pong window must fit the 16-bit descriptor extent");
+  (void)nSrcs;
+  const int nWarps = nThreads / WARP_SIZE;
+  const int warp = thread / WARP_SIZE;
+  char* stage = ncclTdmStageForWarp(threadIdx.x / WARP_SIZE);
+
+  const uintptr_t src = cvta_to_global(srcPtrFn(0)) + nBytesBehind;
+  const IntBytes nBytes = nBytesAhead;
+  if (nBytes <= 0) return;
+
+  for (int d = 0; d < nDsts; d++) {
+    const uintptr_t dst = cvta_to_global(dstPtrFn(d)) + nBytesBehind;
+    IntBytes off = (IntBytes)warp * Tile;
+    if (off >= nBytes) continue;
+    int buf = 0;
+    uint32_t chunk = (uint32_t)(nBytes - off < Tile ? nBytes - off : Tile);
+    amd_tdm::cp_async_bulk(amd_tdm::space_shared, amd_tdm::space_global, stage + buf * Tile,
+                           reinterpret_cast<const void*>(src + off), chunk);
+    amd_tdm::cp_async_bulk_wait_group_read(amd_tdm::n32_t<0>());
+    while (true) {
+      const IntBytes next = off + (IntBytes)nWarps * Tile;
+      amd_tdm::cp_async_bulk(amd_tdm::space_global, amd_tdm::space_shared, reinterpret_cast<void*>(dst + off),
+                             stage + buf * Tile, chunk);
+      if (next >= nBytes) {
+        amd_tdm::cp_async_bulk_wait_group_read(amd_tdm::n32_t<0>());
+        break;
+      }
+      buf ^= 1;
+      chunk = (uint32_t)(nBytes - next < Tile ? nBytes - next : Tile);
+      amd_tdm::cp_async_bulk(amd_tdm::space_shared, amd_tdm::space_global, stage + buf * Tile,
+                             reinterpret_cast<const void*>(src + next), chunk);
+      amd_tdm::cp_async_bulk_wait_group_read(amd_tdm::n32_t<0>());
+      off = next;
+    }
+  }
+
+  nBytesBehind += nBytes;
+  nBytesAhead = 0;
 }
 
 template <typename RedFn, typename SrcPtrFn, typename IntBytes, int MultimemSrcs, int MinSrcs, int MaxSrcs,
@@ -594,6 +668,20 @@ __device__ __forceinline__ void reduceCopy(int thread, int nThreads, uint64_t re
   IntBytes nBytesBehind = 0;
   IntBytes nBytesAhead = nElts * sizeof(T);
   // bool useAcc = accPtrFn() != nullptr;
+
+  // gfx1250 TDM copy path: any pure copy (1 source, no reduce / multimem /
+  // preop / postop / accumulate). Runtime nSrcs/nDsts decide; MaxSrcs/MaxDsts
+  // may be >1. The whole range is consumed so the vector-unit loops below are
+  // skipped for that copy.
+  if constexpr (amd_tdm::available() && MultimemSrcs == 0 && MultimemDsts == 0 && PreOpSrcs == 0 && !useAcc) {
+    if (!postOp && nSrcs == 1 && nDsts >= 1 && nBytesAhead > 0) {
+      reduceCopyPacksTdm<RedFn, T, Unroll, /*BytePerPack=*/16, MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts,
+                         MaxDsts, PreOpSrcs>(nThreads, thread, nSrcs, srcPtrFn, nDsts, dstPtrFn, nBytesBehind,
+                                             nBytesAhead);
+      if (nBytesAhead == 0) return;
+    }
+  }
+
   // For Dword or larger reads or writes, the two LSBs of the byte-address are ignored, thus forcing Dword
   // alignment.
   constexpr int AlignedPathPackSize = 4;
