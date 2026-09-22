@@ -1116,6 +1116,11 @@ static void showVersion() {
 NCCL_PARAM(MNNVLUUID, "MNNVL_UUID", -1);
 NCCL_PARAM(MNNVLCliqueId, "MNNVL_CLIQUE_ID", -1);
 NCCL_PARAM(MNNVLCrossClique, "MNNVL_CROSS_CLIQUE", 0);
+// Testing hack: report every node as its own virtual POD, so MNNVL stops at the chassis boundary.
+// On a fabric that spans several chassis every rank pair is reachable over UALoE, so collectives
+// never touch a NIC and the cross-node NIC/GDR path cannot be exercised. With this set, intra-node
+// peers keep the fabric and inter-node peers fall back to the network transport.
+NCCL_PARAM(MNNVLPerNodeVpod, "MNNVL_PER_NODE_VPOD", 0);
 
 static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, uint64_t commHash) {
   cudaDeviceProp prop;
@@ -1270,6 +1275,24 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
     if (info->fabricInfo.fabricSupported) {
       uint64_t uuid0 = 0;
       uint64_t uuid1 = 0;
+      if (ncclParamMNNVLPerNodeVpod()) {
+        uint64_t pod0 = 0, pod1 = 0;
+        memcpy(&pod0, info->fabricInfo.clusterUuid, sizeof(pod0));
+        memcpy(&pod1, info->fabricInfo.clusterUuid + sizeof(pod0), sizeof(pod1));
+        // A zero UUID already means "no usable fabric info", so leave that case alone rather than
+        // switch MNNVL on where it would have stayed off.
+        if ((pod0 | pod1) != 0) {
+          // hostHash folds in the comm hash, so this is stable across the job and distinct per node.
+          uint32_t vpod = (uint32_t)(info->hostHash ^ (info->hostHash >> 32));
+          INFO(NCCL_INIT, "MNNVL per-node VPOD: cliqueId 0x%x -> 0x%x (hostHash 0x%lx)", info->fabricInfo.cliqueId,
+               vpod, (unsigned long)info->hostHash);
+          info->fabricInfo.cliqueId = vpod;
+          // Move the physical POD id with it, so nvlDomainSize matches the clique and
+          // NCCL_MNNVL_CROSS_CLIQUE cannot hand the fabric back across nodes.
+          pod0 ^= info->hostHash;
+          memcpy(info->fabricInfo.clusterUuid, &pod0, sizeof(pod0));
+        }
+      }
       memcpy(&uuid0, info->fabricInfo.clusterUuid, sizeof(uuid0));
       memcpy(&uuid1, info->fabricInfo.clusterUuid + sizeof(uuid0), sizeof(uuid1));
       INFO(NCCL_INIT,
