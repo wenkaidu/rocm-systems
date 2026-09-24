@@ -128,10 +128,10 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload, Metadata, Pi
         if (checkAbort(abort, 1, spins)) break;
       }
       if (sendConnFifo) {
-        int size = ((sendConnHead & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK) ?
-                     stepLines * sizeof(union ncclLLFifoLine) :
-                     nbytes;
-        sendConnFifo[sendConnHead % NCCL_STEPS].size = size;
+        ssize_t size = ((sendConnHead & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK) ?
+                         stepLines * sizeof(union ncclLLFifoLine) :
+                         nbytes;
+        st_relaxed_sys(const_cast<ssize_t*>(&sendConnFifo[sendConnHead % NCCL_STEPS].size), size);
       }
       sendConnHead += 1;
     }
@@ -143,7 +143,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload, Metadata, Pi
   }
   inline __device__ void postRecv() {
     barrier();
-    if (recvConnHeadPtr) STORE(recvConnHeadPtr, recvConnHead += 1);
+    if (recvConnHeadPtr) st_relaxed_sys_global((uint64_t*)recvConnHeadPtr, recvConnHead += 1);
   }
 
   inline __device__ void incSend(int i, int offset) {

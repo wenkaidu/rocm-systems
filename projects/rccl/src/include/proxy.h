@@ -176,6 +176,8 @@ struct ncclProxySubArgs {
   uint64_t done;
   uint64_t end;
   int regBufferReady;
+  // Consecutive isend() calls that returned no request handle for this sub.
+  uint64_t isendNoRequest;
   void* requests[NCCL_STEPS];
 
   // Profiler plugin

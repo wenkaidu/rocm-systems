@@ -93,6 +93,10 @@ static ncclResult_t IbCastPrintWr(struct ibv_send_wr* wr, char* wrStr) {
 // The alignment for IB writes that is required to make LL and LL128 protocols work
 #define IB_WRITE_CHUNK_ALIGNMENT 128
 
+// How many back-to-back IbCastIsend() calls that cannot post before we log. Power of two.
+#define IBCAST_ISEND_STALL_SPINS (1 << 22)
+static_assert(NCCL_NET_IB_MAX_RECVS == 8, "the stalled-slot WARN below prints exactly 8 reqs entries");
+
 ncclResult_t IbCastMultiSend(struct ncclIbSendComm* comm, int slot, int nqps, int startQpIndex, bool wrrSched,
                              bool useWriteOp) {
   struct ncclIbRequest** reqs = comm->sendReqs[slot];
@@ -411,8 +415,13 @@ ncclResult_t IbCastIsend(void* sendComm, void* data, size_t size, int tag, void*
         int qpIdx = comm->base.qpIndex;
         if (qpIdx >= 0 && qpIdx < comm->base.nqps) rcclTelemetryQpSlotMiss(comm->base.qps[qpIdx].telQpStats);
       }
+      if ((++comm->ctsIdxWaitSpins & (IBCAST_ISEND_STALL_SPINS - 1)) == 0) {
+        WARN("NET/IB: %s: waiting %lu times for CTS idx %u at slot %d, fifo holds %u (comm=%p, fifoHead=%lu, tag=%x)",
+             __func__, comm->ctsIdxWaitSpins, idx, slot, ctsFifoIdx(slots, 0), comm, comm->base.fifoHead, tag);
+      }
       return ncclSuccess;
     }
+    comm->ctsIdxWaitSpins = 0;
     nreqs = ctsFifoNreqs(slots, 0);
     // Wait until all data has arrived
     for (int r = 1; r < nreqs; r++)
@@ -523,9 +532,19 @@ ncclResult_t IbCastIsend(void* sendComm, void* data, size_t size, int tag, void*
 
     comm->base.fifoHead++;
     TIME_STOP(0);
+    comm->ctsNoSlotSpins = 0;
     return ncclSuccess;
   }
 
+  // The CTS is present but no entry in this slot could take the send: either every
+  // reqs[r] is still occupied by a request the completion path never released, or no
+  // entry carries our tag. Both stall this comm permanently, so say which it is.
+  if ((++comm->ctsNoSlotSpins & (IBCAST_ISEND_STALL_SPINS - 1)) == 0) {
+    WARN("NET/IB: %s: CTS present but no free slot entry %lu times (comm=%p, fifoHead=%lu, slot=%d, nreqs=%d, tag=%x, "
+         "sendReqsCnt=%d, reqs=[%p,%p,%p,%p,%p,%p,%p,%p])",
+         __func__, comm->ctsNoSlotSpins, comm, comm->base.fifoHead, slot, nreqs, tag, comm->sendReqsCnt[slot], reqs[0],
+         reqs[1], reqs[2], reqs[3], reqs[4], reqs[5], reqs[6], reqs[7]);
+  }
   *request = NULL;
   return ncclSuccess;
 }

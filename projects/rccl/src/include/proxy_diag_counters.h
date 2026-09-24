@@ -18,4 +18,7 @@ enum ncclProxyDiagCounter : uint8_t {
   ncclProxyDiagRecvTail = 8,
   ncclProxyDiagTailOrHead = 9,
   ncclProxyDiagFifoSzOrHeadCache = 10,
+  // Consecutive isend() calls that returned without a request handle. Non-zero
+  // means the gate passed and the net plugin declined to post.
+  ncclProxyDiagIsendNoRequest = 11,
 };

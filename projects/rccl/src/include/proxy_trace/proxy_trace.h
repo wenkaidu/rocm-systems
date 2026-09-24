@@ -52,6 +52,8 @@ enum class ProxyCounterTypes {
   // for sender this is data size of D2D copy; for receiver this is head cache,
   // i.e., sub->base + sub->done
   FIFO_SZ_OR_HEAD_CACHE,
+  // consecutive isend() calls that came back without a request handle
+  ISEND_NO_REQUEST,
   UNINITIALIZED = 100
 };
 
@@ -106,6 +108,7 @@ struct ProxyTraceOp {
     {ProxyCounterTypes::RECV_TAIL, 0},
     {ProxyCounterTypes::TAIL_OR_HEAD, 0},
     {ProxyCounterTypes::FIFO_SZ_OR_HEAD_CACHE, -1},
+    {ProxyCounterTypes::ISEND_NO_REQUEST, 0},
   };
   ProxyCounterTypes lastUpdatingCounter{ProxyCounterTypes::UNINITIALIZED};
   ProxyOpType opType{ProxyOpType::SEND};

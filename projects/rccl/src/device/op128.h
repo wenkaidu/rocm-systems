@@ -472,6 +472,22 @@ __device__ __forceinline__ void st_release_sys_global(uint64_t* ptr, uint64_t va
                           __MEMORY_SCOPE_SYSTEM);
 }
 
+// Typed accessors for the flags the kernel exchanges with the CPU proxy thread
+// (connFifo size/offset and the head/tail steps). Agent scope is not enough:
+// the proxy writes these from the host, so an agent-scope load can be serviced
+// from a stale L2 line and an agent-scope store can sit in L2 where the proxy
+// never sees it. System scope sets sc0/sc1 so the access bypasses the caches.
+template <typename T>
+__device__ __forceinline__ T ld_relaxed_sys(const T* ptr) {
+  return __scoped_atomic_load_n((__attribute__((address_space(1))) const T*)ptr, __ATOMIC_RELAXED,
+                                __MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
+__device__ __forceinline__ void st_relaxed_sys(T* ptr, T val) {
+  __scoped_atomic_store_n((__attribute__((address_space(1))) T*)ptr, val, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+}
+
 __device__ __forceinline__ void fence_acq_rel_sys() {
   // asm volatile("membar.sys;" ::: "memory");
 }

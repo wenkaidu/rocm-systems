@@ -166,7 +166,7 @@ std::string facebook_rccl::ProxyTraceOp::str() {
   snprintf(buf, sizeof(buf),
            "createT:%lld, lastT:%lld, postT:%lld, sendT:%lld, cntNm:%d, %s, %s, %d->%d(%s), "
            "chan:%d, status:%s, ns:%d, nb:%u, po:%lld, ke:%lld, tail/h:%lld, recvT:%lld, "
-           "connSz/h:%lld, trans:%lld, flushed:%lld, recvd:%lld, done:%lld\n",
+           "connSz/h:%lld, trans:%lld, flushed:%lld, recvd:%lld, done:%lld, isendNull:%lld\n",
            (long long)ms(startTs),
            (long long)ms(lastUpdateTs),
            (long long)ms(timestamps[facebook_rccl::ProxyCounterTypes::POSTED]),
@@ -187,7 +187,8 @@ std::string facebook_rccl::ProxyTraceOp::str() {
            (long long)counters[ProxyCounterTypes::TRANSMITTED],
            (long long)counters[ProxyCounterTypes::FLUSHED],
            (long long)counters[ProxyCounterTypes::RECEIVED],
-           (long long)counters[ProxyCounterTypes::DONE]);
+           (long long)counters[ProxyCounterTypes::DONE],
+           (long long)counters[ProxyCounterTypes::ISEND_NO_REQUEST]);
   return std::string(buf);
 }
 

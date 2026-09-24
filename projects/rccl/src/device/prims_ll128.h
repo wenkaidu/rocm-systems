@@ -160,18 +160,18 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload, Metadata,
       int spins = 0;
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
         __builtin_amdgcn_s_sleep(1);
-        sendConnHeadCache = __atomic_load_n(sendConnHeadPtr, __ATOMIC_RELAXED);
+        sendConnHeadCache = ld_relaxed_sys((uint64_t*)sendConnHeadPtr);
         if (checkAbort(abort, 1, spins)) break;
       }
       if (sendConnFifo) {
-        sendConnFifo[sendStep[wid] % NCCL_STEPS].size = nbytes;
+        st_relaxed_sys(const_cast<ssize_t*>(&sendConnFifo[sendStep[wid] % NCCL_STEPS].size), (ssize_t)nbytes);
       }
       sendConnHead += 1;
     }
   }
 
   inline __device__ void postRecv() {
-    if (recvConnHeadPtr) STORE(recvConnHeadPtr, recvConnHead += 1);
+    if (recvConnHeadPtr) st_relaxed_sys_global((uint64_t*)recvConnHeadPtr, recvConnHead += 1);
   }
   inline __device__ void postSend() {
     if (sendConnTailPtr) {
@@ -187,7 +187,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload, Metadata,
       } else {
         __threadfence_system();
       }
-      STORE((unsigned long long*)sendConnTailPtr, sendConnTail += 1);
+      st_relaxed_sys_global((uint64_t*)sendConnTailPtr, sendConnTail += 1);
     }
   }
 

@@ -637,6 +637,10 @@ struct ncclIbSendComm {
   int ar; // Use adaptive routing when all merged devices have it enabled
   uint64_t putSignalScratchpad;
   bool useCtsOffload;
+  // Back-to-back IbCastIsend() calls that could not post, split by cause: the CTS for
+  // fifoHead+1 not being visible yet, versus every slot entry still being occupied.
+  uint64_t ctsIdxWaitSpins;
+  uint64_t ctsNoSlotSpins;
   int telChId; // Telemetry: NCCL channel ID for this communicator
   // Resolved slot for telChId on this comm's first device (NULL if untracked).
   // Same reasoning as ncclIbQp::telQpStats: avoid re-resolving per completion.

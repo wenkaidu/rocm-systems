@@ -103,8 +103,9 @@ class Primitives<T, RedOp, Fan, Direct,
       return ans;
     }
 #endif
-    // volatile is faster than acquire but not as correct. Make sure reduceCopy
-    // loads data using volatile so it doesn't see stale data in L1.
+    // The peer publishing this step can be the CPU proxy thread, so the poll
+    // has to be system scope; an agent-scope load may keep hitting a stale L2
+    // line and never observe the host write.
     //
     // To be revisited for correctness on gfx1250
 #if defined(__gfx950__)
@@ -114,7 +115,7 @@ class Primitives<T, RedOp, Fan, Direct,
 #elif defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__)
     return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
 #else
-    return __atomic_load_n(ptr, __ATOMIC_RELAXED);
+    return ld_relaxed_sys_global(ptr);
 #endif
   }
 
@@ -143,7 +144,7 @@ class Primitives<T, RedOp, Fan, Direct,
 
     if (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend)) {
       if ((flags & ConnFifoEnabled) && (flags & (Send * RoleWaitSend)))
-        connFifo[step % NCCL_STEPS].size = nelts * sizeof(T);
+        st_relaxed_sys(&connFifo[step % NCCL_STEPS].size, (ssize_t)(nelts * sizeof(T)));
 
       void** ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst) : (ncclShmem.groups[group].srcs + Src);
       if ((flags & NetRegMode) && ((!isSendNotRecv && DirectRecv) || (isSendNotRecv && DirectSend))) {
@@ -158,7 +159,7 @@ class Primitives<T, RedOp, Fan, Direct,
           }
         }
       } else if ((flags & ConnFifoEnabled) && connFifo[step % NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
-        ptrs[index] = connEltsFifo + loadSsize(&connFifo[step % NCCL_STEPS].offset) / sizeof(T);
+        ptrs[index] = connEltsFifo + ld_relaxed_sys(&connFifo[step % NCCL_STEPS].offset) / sizeof(T);
       } else if (isSendNotRecv && DirectSend) {
         // directBuff is only assigned by setDataPtrs when (Direct && ipcReg);
         // when Direct=1 but no buffer was registered, it stays NULL and using
@@ -210,7 +211,7 @@ class Primitives<T, RedOp, Fan, Direct,
 
     if (flags & (Recv * RolePostRecv | Send * RolePostSend)) {
       step += StepPerSlice;
-      STORE(connStepPtr, step);
+      st_relaxed_sys_global(connStepPtr, step);
     }
   }
 
@@ -387,7 +388,7 @@ public:
           }
           void** ptrs = isSendNotRecv ? ncclShmem.groups[group].dsts : ncclShmem.groups[group].srcs;
           if ((flags & ConnFifoEnabled) && connFifo[step % NCCL_STEPS].mode == NCCL_MODE_OFFSET) {
-            ssize_t offset = loadSsize(&connFifo[step % NCCL_STEPS].offset);
+            ssize_t offset = ld_relaxed_sys(&connFifo[step % NCCL_STEPS].offset);
             ptrs[index] = connEltsFifo + offset / sizeof(T);
           } else if (Direct && fn.work->regUsed) {
             if (isSendNotRecv) {
@@ -435,7 +436,7 @@ public:
         // coverity[dead_error_begin]
         dstSize = ncclShmem.groups[group].dstSizes[index];
         ncclShmem.groups[group].dstSizes[index] = 0;
-        if (flags & ConnFifoEnabled) connFifo[step % NCCL_STEPS].size = dstSize * sizeof(T);
+        if (flags & ConnFifoEnabled) st_relaxed_sys(&connFifo[step % NCCL_STEPS].size, (ssize_t)(dstSize * sizeof(T)));
       }
       barrier();
       if (flags & (Recv * (RoleWaitRecv | RolePostRecv) | Send * (RoleWaitSend | RolePostSend))) {
@@ -534,7 +535,7 @@ private:
     step = roundUp(step, SlicePerChunk * StepPerSlice);
     if (flags & RolePostRecv) {
       connStepPtr = conn->head;
-      STORE(connStepPtr, step); // Return credits in case we rounded up.
+      st_relaxed_sys_global(connStepPtr, step); // Return credits in case we rounded up.
     }
     if (flags & RoleWaitRecv) {
       if ((flags & PatMode) == 0)
@@ -568,7 +569,7 @@ private:
         if (netRegFlag) {
           if (conn->flags & NCCL_DIRECT_NIC) {
             flags |= NetRegMode;
-            connFifo[step % NCCL_STEPS].size = 0;
+            st_relaxed_sys(&connFifo[step % NCCL_STEPS].size, (ssize_t)0);
           }
         }
       }
@@ -865,9 +866,9 @@ __forceinline__ __device__ ~Primitives() {
     // We don't want the next CUDA kernel to overwrite the send buffer which
     // was accessed directly.
     uint64_t prevStep = step - StepPerSlice;
-    volatile ssize_t* ptr = &(connFifo[prevStep % NCCL_STEPS].size);
+    ssize_t* ptr = &(connFifo[prevStep % NCCL_STEPS].size);
     int spins = 0;
-    while (*ptr != -1)
+    while (ld_relaxed_sys(ptr) != -1)
       if (checkAbort(flags, Aborted, spins)) break;
   }
 
@@ -1291,7 +1292,7 @@ __device__ __forceinline__ void patReduce(struct ncclPatStep* ps, struct ncclPat
   // Store conn step here inside the two barriers to make sure next reload will see the update.
   if (postSend && (flags & RolePostSend)) {
     if (peer->connFifo) {
-      peer->connFifo[step % NCCL_STEPS].size = (ps->sendOffset + nelem) * sizeof(T);
+      st_relaxed_sys(&peer->connFifo[step % NCCL_STEPS].size, (ssize_t)((ps->sendOffset + nelem) * sizeof(T)));
     }
     peer->step = step += StepPerSlice;
     st_relaxed_sys_global(&peer->conn->step, step);
@@ -1447,7 +1448,7 @@ __device__ __forceinline__ void patCopy(struct ncclPatStep* ps, struct ncclPatSh
   // Store conn step here inside the two barriers to make sure next reload will see the update.
   if (postSend && (flags & RolePostSend)) {
     if (peer->connFifo) {
-      peer->connFifo[step % NCCL_STEPS].size = (ps->sendOffset + nelem) * sizeof(T);
+      st_relaxed_sys(&peer->connFifo[step % NCCL_STEPS].size, (ssize_t)((ps->sendOffset + nelem) * sizeof(T)));
     }
     peer->step = step += StepPerSlice;
     st_relaxed_sys_global(&peer->conn->step, step);
