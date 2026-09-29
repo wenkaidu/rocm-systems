@@ -603,8 +603,10 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
   // We don't know which devIndex the recv was on, so we flush on all devices
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     struct ibv_send_wr wr;
-    // Check if GPU flush buffer was successfully registered
-    // If not, fall back to using user data buffer for flush
+    // RCCL: fence the RO=1 bulk data through an RO=0 scratchpad - RDMA_WRITE a
+    // dummy payload into it, then RDMA_READ it back. The WRITE needs REMOTE_WRITE
+    // on the flush QP. If the scratchpad was not registered, fall back to reading
+    // the user buffer.
     bool useGpuFlushMem = rcclParamIbGdrFlushGpuMemNoRelaxedOrdering() &&
                           comm->devs[i].gpuFlush.gpuFlushGpuMem != nullptr &&
                           comm->devs[i].gpuFlush.gpuMr != nullptr;

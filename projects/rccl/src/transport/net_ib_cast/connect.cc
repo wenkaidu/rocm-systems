@@ -1499,10 +1499,45 @@ ib_recv:
     if (rComm->flushEnabled) {
       if (rcclParamIbCastGdrFlushGpuMemNoRelaxedOrdering()) {
 #if defined(HIP_UNCACHED_MEMORY)
-        NCCLCHECKGOTO(ncclCudaCalloc(&rCommDev->gpuFlush.gpuFlushGpuMem, sizeof(int), /*manager=*/nullptr, ncclMemPersist, hipDeviceMallocUncached), ret, fail);
+        const unsigned int gpuFlushFlags = hipDeviceMallocUncached;
 #else
-        NCCLCHECKGOTO(ncclCudaCalloc(&rCommDev->gpuFlush.gpuFlushGpuMem, sizeof(int), /*manager=*/nullptr, ncclMemPersist, hipDeviceMallocFinegrained), ret, fail);
+        const unsigned int gpuFlushFlags = hipDeviceMallocFinegrained;
 #endif
+        // Allocate directly through HIP rather than ncclCudaCalloc: with cuMem
+        // enabled the latter routes to the VMM allocator and drops these flags.
+        // Proxy-thread HIP ops must use a non-blocking stream: hipMemset on the
+        // legacy stream conflicts with ThreadLocal graph capture.
+        hipError_t hipFlushSt =
+          hipExtMallocWithFlags((void**)&rCommDev->gpuFlush.gpuFlushGpuMem, sizeof(int), gpuFlushFlags);
+        if (hipFlushSt != hipSuccess) {
+          ret = rcclCudaErrorHandler(hipFlushSt);
+          goto fail;
+        }
+        cudaStreamCaptureMode capMode = cudaStreamCaptureModeRelaxed;
+        bool capModeExchanged = false;
+        cudaStream_t zeroStream = nullptr;
+        hipFlushSt = cudaThreadExchangeStreamCaptureMode(&capMode);
+        if (hipFlushSt == hipSuccess) {
+          capModeExchanged = true;
+          hipFlushSt = cudaStreamCreateWithFlags(&zeroStream, cudaStreamNonBlocking);
+        }
+        if (hipFlushSt == hipSuccess)
+          hipFlushSt = cudaMemsetAsync(rCommDev->gpuFlush.gpuFlushGpuMem, 0, sizeof(int), zeroStream);
+        if (hipFlushSt == hipSuccess) hipFlushSt = cudaStreamSynchronize(zeroStream);
+        if (zeroStream != nullptr) {
+          cudaError_t destroySt = cudaStreamDestroy(zeroStream);
+          if (hipFlushSt == hipSuccess) hipFlushSt = destroySt;
+        }
+        if (capModeExchanged) {
+          cudaError_t restoreSt = cudaThreadExchangeStreamCaptureMode(&capMode);
+          if (hipFlushSt == hipSuccess) hipFlushSt = restoreSt;
+        }
+        if (hipFlushSt != hipSuccess) {
+          (void)hipFree(rCommDev->gpuFlush.gpuFlushGpuMem);
+          rCommDev->gpuFlush.gpuFlushGpuMem = nullptr;
+          ret = rcclCudaErrorHandler(hipFlushSt);
+          goto fail;
+        }
         if (useDmaBuf) {
           uint64_t exportOffset = 0;
           void *aligned_ptr = NULL;
@@ -1626,7 +1661,7 @@ ncclResult_t IbCastCloseRecv(void* recvComm) {
       struct ncclIbRecvCommDev* commDev = comm->devs + i;
       if (comm->flushEnabled) {
         if (commDev->gpuFlush.gpuFlushGpuMem != nullptr) {
-          NCCLCHECK(ncclCudaFree(commDev->gpuFlush.gpuFlushGpuMem, /*manager=*/nullptr));
+          CUDACHECK(hipFree(commDev->gpuFlush.gpuFlushGpuMem));
           commDev->gpuFlush.gpuFlushGpuMem = nullptr;
           if (commDev->gpuFlush.gpuMr != nullptr) NCCLCHECK(wrap_ibv_dereg_mr(commDev->gpuFlush.gpuMr));
           commDev->gpuFlush.gpuMr = nullptr;
