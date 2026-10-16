@@ -32,6 +32,12 @@ extern ncclNet_t ncclNetIb;
 extern ncclNet_t ncclNetSocket;
 // Labels an ncclNetIb send/recv comm for RCCL_IB_CTS_TELEMETRY output.
 void ncclIbCtsTelemetrySetConn(void* netComm, int channelId, int rank, int peerRank);
+// RCCL_IB_GDR_FLUSH_FLAG=1: GPU-visible flag of an ncclNetIb recv comm (NULL if
+// not negotiated), and the flag value covering every completed receive.
+uint64_t* ncclIbGetGpuFlushFlag(void* recvComm);
+uint64_t ncclIbGetGpuFlushFlagSeq(void* recvComm);
+// Whether the following irecv needs the flag write (SIMPLE GDR receives only).
+void ncclIbSetGpuFlushFlagHint(void* recvComm, int need);
 
 extern ncclResult_t rcclNetP2pPolicy(void* handle, int isP2p);
 extern int64_t ncclParamDmaBufEnable();
