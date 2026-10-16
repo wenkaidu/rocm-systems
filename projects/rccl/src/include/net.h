@@ -45,6 +45,10 @@ extern int64_t ncclParamDmaBufEnable();
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 extern ncclNet_t netIbCast;
 extern ncclResult_t rcclCastNetP2pPolicy(void* handle, int isP2p);
+// netIbCast counterparts of ncclIbGetGpuFlushFlag and friends.
+uint64_t* IbCastGetGpuFlushFlag(void* recvComm);
+uint64_t IbCastGetGpuFlushFlagSeq(void* recvComm);
+void IbCastSetGpuFlushFlagHint(void* recvComm, int need);
 
 enum rcclIBNicType {
   rcclIBNicTypeUnknown = -1,

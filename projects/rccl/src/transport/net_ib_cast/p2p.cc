@@ -137,6 +137,7 @@ ncclResult_t IbCastMultiSend(struct ncclIbSendComm* comm, int slot, int nqps, in
   // - nreqs > 1
   //      Sizes are written directly to remote completion records array
   struct ibv_send_wr* lastWr = comm->wrs + nreqs - 1;
+  struct ibv_send_wr* sizesWr = NULL;
   if (!useWriteOp) {
     uint32_t immData;
     if (comm->base.recvMatchingScheme != BY_INDEX) {
@@ -149,8 +150,28 @@ ncclResult_t IbCastMultiSend(struct ncclIbSendComm* comm, int slot, int nqps, in
       }
     }
 
-    if (nreqs > 1 ||
-        (!(comm->base.remOooRq && comm->base.localOooRq) && comm->ar && reqs[0]->send.size > IbCastArThreshold)) {
+    if (comm->flagFlush && ctsFifoFlagFlush(slots, 0)) {
+      // Payload and sizes go out as plain RDMA writes followed by the flag
+      // write, which carries the immediate data. The receiver takes the size
+      // from wc->byte_len otherwise, which would now be the flag size, so the
+      // sizes array is written even for a single receive.
+      sizesWr = ++lastWr;
+      memset(sizesWr, 0, sizeof(struct ibv_send_wr));
+      sizesWr->wr.rdma.remote_addr = comm->remCmplsRecords.addr + slot * sizeof(struct ncclIbRequestCompletionRecord);
+      sizesWr->num_sge = 1;
+      sizesWr->wr_id = wr_id;
+      sizesWr->opcode = IBV_WR_RDMA_WRITE;
+      sizesWr->next = sizesWr + 1;
+      lastWr++;
+      memset(lastWr, 0, sizeof(struct ibv_send_wr));
+      comm->flagFlushSrc[slot] = reqs[0]->id + 1;
+      comm->flagFlushSge.addr = (uint64_t)&comm->flagFlushSrc[slot];
+      lastWr->sg_list = &comm->flagFlushSge;
+      lastWr->num_sge = 1;
+      lastWr->wr.rdma.remote_addr = comm->flagFlushRemAddr;
+      lastWr->wr.rdma.rkey = comm->flagFlushRkey;
+    } else if (nreqs > 1 ||
+               (!(comm->base.remOooRq && comm->base.localOooRq) && comm->ar && reqs[0]->send.size > IbCastArThreshold)) {
       // When Adaptive Routing is enabled, send the bulk of the data first as an
       // RDMA Write.
       lastWr++;
@@ -159,6 +180,7 @@ ncclResult_t IbCastMultiSend(struct ncclIbSendComm* comm, int slot, int nqps, in
         // Write remote sizes array
         lastWr->wr.rdma.remote_addr = comm->remCmplsRecords.addr + slot * sizeof(struct ncclIbRequestCompletionRecord);
         lastWr->num_sge = 1;
+        sizesWr = lastWr;
       }
     }
     lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
@@ -243,15 +265,15 @@ ncclResult_t IbCastMultiSend(struct ncclIbSendComm* comm, int slot, int nqps, in
       }
     }
 
-    if (nreqs > 1) {
+    if (sizesWr) {
       // Populating the correct gather information based on the device and
       // slot used.
       // Note that the lkey is already correct from the initialization phase.
-      lastWr->sg_list = &(comm->devs[devIndex].sge);
-      lastWr->sg_list[0].addr = (uint64_t)(comm->remCmplsRecords.elems[slot]);
-      lastWr->sg_list[0].length = nreqs * sizeof(int);
+      sizesWr->sg_list = &(comm->devs[devIndex].sge);
+      sizesWr->sg_list[0].addr = (uint64_t)(comm->remCmplsRecords.elems[slot]);
+      sizesWr->sg_list[0].length = nreqs * sizeof(int);
       // Populate the correct RKey based on the device used
-      lastWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[devIndex];
+      sizesWr->wr.rdma.rkey = comm->remCmplsRecords.rkeys[devIndex];
     }
 
     struct ibv_send_wr* bad_wr;
@@ -619,6 +641,7 @@ ncclResult_t IbCastIrecv(void* recvComm, int n, void** data, size_t* sizes, int*
   comm->recvReqs[slot] = req;
 
   req->recv.aggSize = 0;
+  req->recv.flagFlush = comm->flagFlush && comm->flagFlushHint;
   req->recv.cmplsRecords = &comm->cmplsRecords[slot];
   memset(req->recv.cmplsRecords->sizes, 0, sizeof(int) * n);
   memset(req->recv.cmplsRecords->completions, 0, sizeof(req->recv.cmplsRecords->completions));
@@ -678,6 +701,7 @@ ncclResult_t IbCastIrecv(void* recvComm, int n, void** data, size_t* sizes, int*
       localElemInline[i].tag = (uint16_t)tags[i];
       localElemInline[i].idx = (uint32_t)(comm->base.fifoHead+1);
       localElemInline[i].rxReqIndex = (uint8_t)rxReqIndex;
+      localElemInline[i].flagFlush = req->recv.flagFlush;
     } else {
       localElem[i].addr = (uint64_t)data[i];
       // Send all applicable rkeys
@@ -689,6 +713,7 @@ ncclResult_t IbCastIrecv(void* recvComm, int n, void** data, size_t* sizes, int*
       localElem[i].tag = tags[i];
       localElem[i].idx = (uint32_t)(comm->base.fifoHead + 1);
       localElem[i].rxReqIndex = rxReqIndex;
+      localElem[i].flagFlush = req->recv.flagFlush;
     }
   }
 
@@ -845,6 +870,10 @@ static inline ncclResult_t IbCastRequestComplete(struct ncclIbRequest* r, int* d
   TRACE(NCCL_NET, "NET/IB: %s: %s request completed (req=%p, comm=%p, id=%ld, type=%s)", __func__,
         r->base->isSend ? "Send" : "Recv", r, r->base, r->id, IbCastReqTypeStr[r->type]);
   *done = 1;
+  if (r->type == NCCL_NET_IB_REQ_RECV && r->recv.flagFlush) {
+    struct ncclIbRecvComm* recvComm = (struct ncclIbRecvComm*)r->base;
+    if (r->id + 1 > recvComm->flagFlushLastSeq) recvComm->flagFlushLastSeq = r->id + 1;
+  }
   if (sizes && r->type == NCCL_NET_IB_REQ_RECV) {
     TRACE(NCCL_NET, "NET/IB: %s: Recv request completed (req=%p, comm=%p, id=%ld, type=%s, nreqs=%d)", __func__, r,
           r->base, r->id, IbCastReqTypeStr[r->type], r->nreqs);
@@ -1086,7 +1115,9 @@ static inline ncclResult_t IbCastCompletionEventProcess(struct ncclIbNetCommBase
              wc->status, ibvWcOpcodeStr(wc->opcode), wc->opcode, wc->qp_num);
         return ncclInternalError;
       }
-      if (req->nreqs == 1) {
+      // With the GDR flush flag the immediate arrives on the 8-byte flag write
+      // and the sender has already written the size into the sizes array.
+      if (req->nreqs == 1 && !req->recv.flagFlush) {
         if (commBase->recvMatchingScheme != BY_ID) {
           req->recv.cmplsRecords->sizes[0] += wc->byte_len;
         } else if (req->recv.cmplsRecords->sizes[0] == 0) {

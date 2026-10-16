@@ -179,6 +179,32 @@ struct netRegInfo {
   int numSegments;
 };
 
+// RCCL_IB_GDR_FLUSH_FLAG is implemented by the IB and IB-CAST transports only.
+static uint64_t* netGetGpuFlushFlag(ncclNet_t* net, void* recvComm) {
+  if (net == &ncclNetIb) return ncclIbGetGpuFlushFlag(recvComm);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  if (net == &netIbCast) return IbCastGetGpuFlushFlag(recvComm);
+#endif
+  return NULL;
+}
+
+static uint64_t netGetGpuFlushFlagSeq(ncclNet_t* net, void* recvComm) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  if (net == &netIbCast) return IbCastGetGpuFlushFlagSeq(recvComm);
+#endif
+  return ncclIbGetGpuFlushFlagSeq(recvComm);
+}
+
+static void netSetGpuFlushFlagHint(ncclNet_t* net, void* recvComm, int need) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  if (net == &netIbCast) {
+    IbCastSetGpuFlushFlagHint(recvComm, need);
+    return;
+  }
+#endif
+  ncclIbSetGpuFlushFlagHint(recvComm, need);
+}
+
 /* Determine if two peers can communicate with NET */
 static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo* info1,
                                struct ncclPeerInfo* info2) {
@@ -1625,8 +1651,8 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
   map->gdrFlushFlag = NULL;
   map->gdrFlushSeq = NULL;
 #if defined(__HIP_PLATFORM_AMD__)
-  if (proxyState->ncclNet == &ncclNetIb && map->sameProcess && resources->useGdr && resources->needFlush &&
-      resources->gdcFlush == NULL && ncclIbGetGpuFlushFlag(resources->netRecvComm) != NULL) {
+  if (map->sameProcess && resources->useGdr && resources->needFlush && resources->gdcFlush == NULL &&
+      netGetGpuFlushFlag(proxyState->ncclNet, resources->netRecvComm) != NULL) {
 #if defined(HIP_UNCACHED_MEMORY)
     const unsigned int seqFlags = hipDeviceMallocUncached;
 #else
@@ -1635,7 +1661,7 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
     if (hipExtMallocWithFlags((void**)&resources->gdrFlushSeq, NCCL_STEPS * sizeof(uint64_t), seqFlags) == hipSuccess) {
       for (int i = 0; i < NCCL_STEPS; i++) __atomic_store_n(resources->gdrFlushSeq + i, 0, __ATOMIC_RELAXED);
       std::atomic_thread_fence(std::memory_order_seq_cst);
-      resources->gdrFlushFlag = ncclIbGetGpuFlushFlag(resources->netRecvComm);
+      resources->gdrFlushFlag = netGetGpuFlushFlag(proxyState->ncclNet, resources->netRecvComm);
       map->gdrFlushFlag = resources->gdrFlushFlag;
       map->gdrFlushSeq = resources->gdrFlushSeq;
     } else {
@@ -2085,7 +2111,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
                                 (subCount == 1);
         if (!checkedNetAttr++) setXferNetAttrs(proxyState, args, 0);
         if (ignoreCompletion) *requestPtr = (void*)NCCL_NET_OPTIONAL_RECV_COMPLETION;
-        if (resources->gdrFlushFlag) ncclIbSetGpuFlushFlagHint(resources->netRecvComm, p == NCCL_PROTO_SIMPLE);
+        if (resources->gdrFlushFlag) {
+          netSetGpuFlushFlagHint(proxyState->ncclNet, resources->netRecvComm, p == NCCL_PROTO_SIMPLE);
+        }
         NCCLCHECK(proxyState->ncclNet->irecv(resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, phandles,
                                              requestPtr));
         if (*requestPtr) {
@@ -2159,7 +2187,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               if (subRes->gdrFlushSeq == NULL) gpuFlagWait = false;
             }
             if (gpuFlagWait) {
-              uint64_t flagSeq = ncclIbGetGpuFlushFlagSeq(resources->netRecvComm);
+              uint64_t flagSeq = netGetGpuFlushFlagSeq(proxyState->ncclNet, resources->netRecvComm);
               for (int i = 0; i < subGroup->groupSize; i++) {
                 struct ncclProxySubArgs* sub = subGroup + i;
                 if (step < sub->nsteps) {

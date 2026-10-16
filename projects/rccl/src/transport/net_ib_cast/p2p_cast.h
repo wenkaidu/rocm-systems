@@ -94,5 +94,10 @@ static inline uint32_t ctsFifoTag(volatile void* slotBase, uint32_t rxReqId) {
     return (uint32_t)((volatile struct ncclIbSendFifoCtsInline*)slotBase)[rxReqId].tag;
   return ((volatile struct ncclIbSendFifo*)slotBase)[rxReqId].tag;
 }
+static inline uint8_t ctsFifoFlagFlush(volatile void* slotBase, uint32_t rxReqId) {
+  if (IbCastAinicCtsInlineData)
+    return ((volatile struct ncclIbSendFifoCtsInline*)slotBase)[rxReqId].flagFlush;
+  return ((volatile struct ncclIbSendFifo*)slotBase)[rxReqId].flagFlush;
+}
 
 #endif // NET_IB_P2P_H_
